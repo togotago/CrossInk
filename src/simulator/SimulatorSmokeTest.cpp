@@ -22,6 +22,7 @@
 #include <filesystem>
 
 #include "AssetDownloadSmokeTest.h"
+#include "AutoProgressSyncSmokeTest.h"
 #include "BookFontSystem.h"
 #include "BookmarkListSmokeTest.h"
 #include "ClippingSelectionSmokeTest.h"
@@ -7368,6 +7369,9 @@ class SimulatorSmokeTest {
           LOG_INF("SMOKE", "Stats upload transport smoke passed");
           std::_Exit(0);
         }
+        // The sleep-time push has its own harness variables and exits when it
+        // runs, so it never depends on the reading-upload fixtures below.
+        verifyAutoProgressSyncContract();
         verifyStatsUploadContract();
         if (prepareReadingUploadSmokeTest()) {
           WiFi.mode(WIFI_STA);

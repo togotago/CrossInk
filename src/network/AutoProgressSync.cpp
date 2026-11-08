@@ -95,36 +95,52 @@ void parkRemote(const KOReaderProgress& remote) {
   if (!SyncParked::park(change)) LOG_ERR(TAG, "Could not park the remote position");
 }
 
-// Sends the collected positions. A single book uses the plain PUT; several use
-// the CrossPoint batch route, and a server without it gets one PUT per book.
+// Sends the collected positions: several books go in one batch request (one TLS
+// handshake), and a server without that route gets one PUT per book instead, as
+// the manual bulk sync does. A single book is always a plain PUT.
 // Only confirmed (2xx) books lose their pending bit. All requests of one burst
 // share one TLS connection.
 void flush(AutoProgressSync::Result& result, std::vector<KOReaderProgress>& batch, std::vector<std::string>& paths,
            KOReaderSyncClient::Connection& connection) {
   if (batch.empty()) return;
-  const bool batchRoute = batch.size() > 1 && KOREADER_STORE.usesCrossPointSyncServer();
-  if (!batchRoute) {
+  bool oneByOne = batch.size() == 1;
+  if (!oneByOne) {
+    const auto error = KOReaderSyncClient::updateProgressBatch(batch, &connection);
+    // Consumed either way: never reused after the request.
+    batch.clear();
+    if (error == KOReaderSyncClient::BATCH_UNSUPPORTED) {
+      // Stock KOSync and older CrossPoint Sync servers: fall back per book.
+      // The positions were released with the batch, so they are mapped again;
+      // this only happens on a server without the route.
+      LOG_INF(TAG, "No batch progress route; sending one book at a time");
+      oneByOne = true;
+    } else if (error != KOReaderSyncClient::OK) {
+      LOG_INF(TAG, "Batch PUT failed (%s); keeping them pending", KOReaderSyncClient::errorString(error).c_str());
+      result.failed += static_cast<uint8_t>(paths.size());
+      paths.clear();
+      return;
+    }
+  }
+  if (oneByOne) {
     for (size_t i = 0; i < paths.size(); ++i) {
-      const auto error = KOReaderSyncClient::updateProgress(batch[i], &connection);
+      KOReaderProgress progress;
+      if (i < batch.size()) {
+        progress = std::move(batch[i]);
+      } else if (!ReadingSyncUpload::prepareProgress(paths[i], progress)) {
+        LOG_INF(TAG, "No usable saved position on retry; keeping it pending: %s", paths[i].c_str());
+        ++result.failed;
+        continue;
+      }
+      const auto error = KOReaderSyncClient::updateProgress(progress, &connection);
       if (error != KOReaderSyncClient::OK) {
         LOG_INF(TAG, "PUT failed (%s); keeping it pending", KOReaderSyncClient::errorString(error).c_str());
+        ++result.failed;
         continue;
       }
       SyncPending::clear(paths[i], SyncPending::PROGRESS_BIT);
       ++result.pushed;
     }
     batch.clear();
-    paths.clear();
-    return;
-  }
-  auto error = KOReaderSyncClient::updateProgressBatch(batch, &connection);
-  // Consumed either way: never reused after the request.
-  batch.clear();
-  if (error != KOReaderSyncClient::OK) {
-    // Nothing is inferred: the books stay pending for the next sleep or manual
-    // sync, which learns the batch route's absence properly.
-    LOG_INF(TAG, "Batch PUT failed (%s); keeping them pending", KOReaderSyncClient::errorString(error).c_str());
-    result.failed += static_cast<uint8_t>(paths.size());
     paths.clear();
     return;
   }
