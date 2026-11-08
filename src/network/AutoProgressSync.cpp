@@ -396,6 +396,30 @@ void AutoProgressSync::noteSyncBootTotal(const uint32_t totalMs) {
   traceFlush();
 }
 
+namespace {
+// Set by traceManualStart() and cleared by traceManualFlush(): only a
+// single-book sync starts a line, so the folder/bulk sync that shares this
+// activity never writes timing marks.
+bool manualTraceActive = false;
+}  // namespace
+
+void AutoProgressSync::traceManualStart(const uint32_t atMs) {
+  manualTraceActive = true;
+  traceAppend("boot=manual");
+  traceAppend("act=+%u", static_cast<unsigned>(atMs));
+}
+
+void AutoProgressSync::traceManualMark(const char* phase, const uint32_t atMs) {
+  if (!manualTraceActive) return;
+  traceAppend("%s=+%u", phase, static_cast<unsigned>(atMs));
+}
+
+void AutoProgressSync::traceManualFlush() {
+  if (!manualTraceActive) return;
+  manualTraceActive = false;
+  traceFlush();
+}
+
 bool AutoProgressSync::joinKnownNetwork(const uint32_t budgetMs) { return connectLastKnownNetwork(budgetMs); }
 
 bool AutoProgressSync::wantsSleepSync(const uint8_t batteryPercent, const uint32_t attempts) {

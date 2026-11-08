@@ -134,6 +134,15 @@ void noteHeap(const char* stage);
 // and comparable across devices.
 void noteSyncBootTotal(uint32_t totalMs);
 
+// Manual-sync timing trace: one "boot=manual" line in the same SD trace the
+// sleep burst writes, started at activity entry and flushed before the return
+// reboot. Each mark records boot-relative millis() and the line carries the
+// trusted epoch second, so the two boots of a manual sync line up. Marks are
+// dropped until start, so bulk and folder syncs never reach this file.
+void traceManualStart(uint32_t atMs);
+void traceManualMark(const char* phase, uint32_t atMs);
+void traceManualFlush();
+
 // Whether sleep should restart into the headless sync boot. Reads the same
 // stores pushPending() gates on, so a device with the setting off, no
 // credentials, a low battery or nothing pending never pays a boot.

@@ -298,6 +298,7 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
 
   WiFi.setSleep(false);
   LOG_DBG("KOSync", "WiFi sleep disabled for sync");
+  AutoProgressSync::traceManualMark("join", millis());
   // One TLS session for the GET and the PUT of this sync.
   syncConnection = makeUniqueNoThrow<KOReaderSyncClient::Connection>();
 
@@ -315,6 +316,7 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
   // and clippings read timestamps already recorded in their files; only an
   // unknown clock (fresh RTC) is worth the exchange.
   if (trustedtime::trustedNow() == 0) syncTimeWithNTP();
+  AutoProgressSync::traceManualMark("ntp", millis());
 
   {
     RenderLock lock(*this);
@@ -473,6 +475,7 @@ void KOReaderSyncActivity::performSync() {
   LOG_DBG("KOSync", "Remote (%s): result=%d http=%d doc=%s remote=%.6f xpath=%s", matchMethodName(primaryMatchMethod),
           result, KOReaderSyncClient::lastHttpCode, documentHash.c_str(), remoteProgress.percentage,
           remoteProgress.progress.c_str());
+  AutoProgressSync::traceManualMark("get", millis());
 
   // Folder sync resolves here with Wi-Fi already active. Single-book sync keeps
   // only its precomputed pointer through the network request.
@@ -520,6 +523,7 @@ void KOReaderSyncActivity::performSync() {
 
   remotePosition =
       mapRemotePosition(epub, renderer, remoteProgress, primaryMatchMethod, currentSpineIndex, totalPagesInSpine);
+  AutoProgressSync::traceManualMark("map_remote", millis());
   if (!remotePosition.valid) {
     {
       RenderLock lock(*this);
@@ -646,6 +650,7 @@ void KOReaderSyncActivity::performUpload() {
   epub.reset();
 
   const auto result = KOReaderSyncClient::updateProgress(progress, syncConnection.get());
+  AutoProgressSync::traceManualMark("put", millis());
 
   if (result == KOReaderSyncClient::OK) {
     progressSucceeded = true;
@@ -795,6 +800,7 @@ void KOReaderSyncActivity::onEnter() {
 
   LOG_INF("KOSync", "network entry free=%u maxAlloc=%u stack=%u", ESP.getFreeHeap(), ESP.getMaxAllocHeap(),
           static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
+  if (quietPaints) AutoProgressSync::traceManualStart(millis());
   uint8_t syncOrientation =
       readerOrientation < CrossPointSettings::ORIENTATION_COUNT ? readerOrientation : SETTINGS.orientation;
   const PendingOverlayResume& resume = APP_STATE.pendingOverlayResume;
@@ -858,6 +864,7 @@ void KOReaderSyncActivity::onEnter() {
       requestUpdate(true);
       return;
     }
+    AutoProgressSync::traceManualMark("map_local", millis());
   }
 
   // Past this point every path uses WiFi.
@@ -905,6 +912,9 @@ void KOReaderSyncActivity::onExit() {
   if (wifiActivated && !folderSync) {
     endSyncConnection();
     wifiOff();
+    AutoProgressSync::traceManualMark("wifi_off", millis());
+    AutoProgressSync::traceManualMark("exit", millis());
+    AutoProgressSync::traceManualFlush();
     if (APP_STATE.pendingOverlayResume.returnsToBookList()) {
       silentRestart();
     } else {
