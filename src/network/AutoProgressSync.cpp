@@ -1,15 +1,15 @@
 #include "AutoProgressSync.h"
 
 #include <Arduino.h>
-#include <cstdarg>
-#include <cstdio>
-#include <algorithm>
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Logging.h>
 #include <TrustedTime.h>
 #include <WiFi.h>
 
+#include <algorithm>
+#include <cstdarg>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -70,10 +70,10 @@ void traceFlush() {
 }
 
 // Serial log and SD trace in one call.
-#define ALOG(level, format, ...)                     \
-  do {                                               \
-    level(TAG, format, ##__VA_ARGS__);               \
-    traceAppend(format, ##__VA_ARGS__);              \
+#define ALOG(level, format, ...)        \
+  do {                                  \
+    level(TAG, format, ##__VA_ARGS__);  \
+    traceAppend(format, ##__VA_ARGS__); \
   } while (0)
 // Bounded clock work: an untrusted clock only skews event timestamps, and the
 // upload carries no timestamp of its own, so this is never worth the 5 s the
