@@ -21,6 +21,8 @@ namespace AutoProgressSync {
 constexpr uint32_t BURST_BUDGET_MS = 8000;
 // Association plus DHCP for the last saved network.
 constexpr uint32_t CONNECT_BUDGET_MS = 5000;
+// The cached access point gets this long before a normal join takes over.
+constexpr uint32_t FAST_JOIN_BUDGET_MS = 2000;
 // Below this the burst is skipped; the same floor the plugin sleep hook uses.
 constexpr uint8_t MIN_BATTERY_PERCENT = 20;
 // 0.1 percentage points, the same epsilon Smart sync uses.
@@ -43,6 +45,18 @@ inline Decision decide(const float localPercentage, const bool hasRemote, const 
 // Wraps with the same uint32 millis() arithmetic as the caller's clock.
 inline bool budgetExhausted(const uint32_t startMs, const uint32_t nowMs, const uint32_t budgetMs = BURST_BUDGET_MS) {
   return static_cast<uint32_t>(nowMs - startMs) >= budgetMs;
+}
+
+enum class JoinPhase : uint8_t {
+  CachedAp,  // join straight at the remembered channel and BSSID
+  FullScan,  // a normal join: the AP roamed, changed channel, or was never seen
+};
+
+// A remembered AP is tried first (one scan avoided), but only for its budget:
+// mesh and band-steering networks move a client between APs, so the fallback
+// must always exist.
+inline JoinPhase joinPhase(const bool hasCachedAp, const uint32_t elapsedMs) {
+  return hasCachedAp && elapsedMs < FAST_JOIN_BUDGET_MS ? JoinPhase::CachedAp : JoinPhase::FullScan;
 }
 
 struct Result {

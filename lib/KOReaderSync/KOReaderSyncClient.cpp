@@ -44,6 +44,23 @@ extern "C" void wolfSSL_Arduino_Serial_Print(const char* const msg) { LOG_DBG("W
 int KOReaderSyncClient::lastHttpCode = 0;
 int KOReaderSyncClient::lastTransportError = 0;
 
+// The shared connection is one already-configured client: insecure (no CA
+// bundle is wired up for wolfSSL) and reused across requests. The simulator's
+// HTTPClient branch has no reusable client, so its Connection is empty and
+// every request keeps its own connection there.
+#ifndef SIMULATOR
+struct KOReaderSyncClient::Connection::Impl {
+  Impl() { http.setInsecure(); }
+  freeink::SecureHttpClient http;
+};
+#else
+struct KOReaderSyncClient::Connection::Impl {};
+#endif
+
+KOReaderSyncClient::Connection::Connection() : impl(new (std::nothrow) Impl()) {}
+
+KOReaderSyncClient::Connection::~Connection() { delete impl; }
+
 namespace {
 
 constexpr bool isSuccessfulHttpCode(int httpCode) { return httpCode >= 200 && httpCode < 300; }
@@ -171,6 +188,106 @@ bool insufficientHeap() {
   }
   return false;
 }
+
+#ifndef SIMULATOR
+// Closes the connection on every return path unless the caller reuses it.
+struct CloseUnlessKept {
+  freeink::SecureHttpClient& http;
+  const bool keepAlive;
+  ~CloseUnlessKept() {
+    if (!keepAlive) http.end();
+  }
+};
+
+// GET one document's progress over an already-configured client. With
+// keepAlive the connection stays open for the caller's next request.
+KOReaderSyncClient::Error getProgressOver(freeink::SecureHttpClient& http, const std::string& url,
+                                          const std::string& documentHash, KOReaderProgress& outProgress,
+                                          const bool keepAlive) {
+  CloseUnlessKept close{http, keepAlive};
+  if (!http.begin(url)) {
+    LOG_ERR("KOSync", "Bad URL: %s", url.c_str());
+    return KOReaderSyncClient::NETWORK_ERROR;
+  }
+  applyAuthHeaders(http);
+  const int httpCode = http.GET();
+  KOReaderSyncClient::lastHttpCode = httpCode;
+  KOReaderSyncClient::lastTransportError = (httpCode < 0) ? httpCode : 0;
+
+  LOG_DBG("KOSync", "Get progress response: %d", httpCode);
+
+  if (httpCode <= 0) return KOReaderSyncClient::NETWORK_ERROR;
+
+  // 204 = success with no stored progress for this document (Spring-style
+  // KOSync implementations; the reference server answers 200 with an empty
+  // object instead). Map it to the same graceful no-remote-progress path as
+  // 404 rather than falling through to SERVER_ERROR — see issue #2876.
+  if (httpCode == 204) return KOReaderSyncClient::NOT_FOUND;
+
+  if (!isSuccessfulHttpCode(httpCode)) {
+    if (httpCode == 401) return KOReaderSyncClient::AUTH_FAILED;
+    if (httpCode == 404) return KOReaderSyncClient::NOT_FOUND;
+    return KOReaderSyncClient::SERVER_ERROR;
+  }
+
+  const std::string& body = http.getString();
+  JsonDocument doc;
+  const DeserializationError error = deserializeJson(doc, body);
+  if (error) {
+    logJsonParseFailure("Get progress", error, body.c_str());
+    return KOReaderSyncClient::JSON_ERROR;
+  }
+  if (doc["progress"].isNull() && !(doc["percentage"].is<float>() && std::isfinite(doc["percentage"].as<float>()) &&
+                                    doc["percentage"].as<float>() >= 0 && doc["percentage"].as<float>() <= 1)) {
+    LOG_DBG("KOSync", "No stored progress in successful response");
+    return KOReaderSyncClient::NOT_FOUND;
+  }
+
+  outProgress.document = documentHash;
+  outProgress.progress = doc["progress"] | "";
+  outProgress.percentage = doc["percentage"].as<float>();
+  outProgress.device = doc["device"].as<std::string>();
+  outProgress.deviceId = doc["device_id"].as<std::string>();
+  outProgress.timestamp = doc["timestamp"].as<int64_t>();
+
+  outProgress.position.reset();
+  if (KOREADER_STORE.supportsRichProgress()) {
+    const JsonObjectConst pos = doc["position"].as<JsonObjectConst>();
+    if (!pos.isNull()) {
+      KOReaderRichPosition rich;
+      rich.pctQ = pos["pctQ"].as<uint32_t>();
+      rich.spineIndex = pos["spine"].as<uint16_t>();
+      rich.pageNumber = pos["page"].as<uint16_t>();
+      const uint16_t pages = pos["pages"].as<uint16_t>();
+      rich.totalPages = pages > 0 ? pages : 1;
+      const uint16_t para = pos["para"].as<uint16_t>();
+      if (para > 0) rich.paragraphIndex = para;
+      rich.xpath = pos["xpath"].as<const char*>() ? pos["xpath"].as<const char*>() : "";
+      LOG_DBG("KOSync", "Got rich position: spine=%u page=%u/%u para=%u", rich.spineIndex, rich.pageNumber,
+              rich.totalPages, para);
+      outProgress.position = std::move(rich);
+    }
+  }
+
+  LOG_DBG("KOSync", "Got progress: %.2f%% at %s", outProgress.percentage * 100, outProgress.progress.c_str());
+  return KOReaderSyncClient::OK;
+}
+
+// PUT `body` as JSON over an already-configured client.
+int putJsonOver(freeink::SecureHttpClient& http, const std::string& url, const std::string& body,
+                const bool keepAlive) {
+  CloseUnlessKept close{http, keepAlive};
+  if (!http.begin(url)) {
+    LOG_ERR("KOSync", "Bad URL: %s", url.c_str());
+    KOReaderSyncClient::lastHttpCode = -1;
+    KOReaderSyncClient::lastTransportError = -1;
+    return -1;
+  }
+  applyAuthHeaders(http);
+  http.addHeader("Content-Type", "application/json");
+  return http.sendRequest("PUT", body);
+}
+#endif  // SIMULATOR
 }  // namespace
 
 KOReaderSyncClient::Error KOReaderSyncClient::authenticate() {
@@ -333,7 +450,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::createUser() {
 }
 
 KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& documentHash,
-                                                          KOReaderProgress& outProgress) {
+                                                          KOReaderProgress& outProgress, Connection* connection) {
   lastHttpCode = 0;
   lastTransportError = 0;
   if (!KOREADER_STORE.hasCredentials()) {
@@ -408,86 +525,14 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
   if (httpCode < 0) return NETWORK_ERROR;
   return SERVER_ERROR;
 #else
+  // A shared connection keeps the TLS session open for the caller's next
+  // request; without one this call owns its connection, as before.
+  if (connection && connection->impl) {
+    return getProgressOver(connection->impl->http, url, documentHash, outProgress, true);
+  }
   freeink::SecureHttpClient http;
   http.setInsecure();
-  if (!http.begin(url)) {
-    LOG_ERR("KOSync", "Bad URL: %s", url.c_str());
-    return NETWORK_ERROR;
-  }
-  applyAuthHeaders(http);
-  const int httpCode = http.GET();
-  lastHttpCode = httpCode;
-  lastTransportError = (httpCode < 0) ? httpCode : 0;
-
-  LOG_DBG("KOSync", "Get progress response: %d", httpCode);
-
-  if (httpCode <= 0) {
-    http.end();
-    return NETWORK_ERROR;
-  }
-
-  // 204 = success with no stored progress for this document (Spring-style
-  // KOSync implementations; the reference server answers 200 with an empty
-  // object instead). Map it to the same graceful no-remote-progress path as
-  // 404 rather than falling through to SERVER_ERROR — see issue #2876.
-  if (httpCode == 204) {
-    http.end();
-    return NOT_FOUND;
-  }
-
-  if (isSuccessfulHttpCode(httpCode)) {
-    const std::string& body = http.getString();
-    JsonDocument doc;
-    const DeserializationError error = deserializeJson(doc, body);
-
-    if (error) {
-      logJsonParseFailure("Get progress", error, body.c_str());
-      http.end();
-      return JSON_ERROR;
-    }
-
-    if (doc["progress"].isNull() && !(doc["percentage"].is<float>() && std::isfinite(doc["percentage"].as<float>()) &&
-                                      doc["percentage"].as<float>() >= 0 && doc["percentage"].as<float>() <= 1)) {
-      http.end();
-      LOG_DBG("KOSync", "No stored progress in successful response");
-      return NOT_FOUND;
-    }
-
-    outProgress.document = documentHash;
-    outProgress.progress = doc["progress"] | "";
-    outProgress.percentage = doc["percentage"].as<float>();
-    outProgress.device = doc["device"].as<std::string>();
-    outProgress.deviceId = doc["device_id"].as<std::string>();
-    outProgress.timestamp = doc["timestamp"].as<int64_t>();
-
-    outProgress.position.reset();
-    if (KOREADER_STORE.supportsRichProgress()) {
-      const JsonObjectConst pos = doc["position"].as<JsonObjectConst>();
-      if (!pos.isNull()) {
-        KOReaderRichPosition rich;
-        rich.pctQ = pos["pctQ"].as<uint32_t>();
-        rich.spineIndex = pos["spine"].as<uint16_t>();
-        rich.pageNumber = pos["page"].as<uint16_t>();
-        const uint16_t pages = pos["pages"].as<uint16_t>();
-        rich.totalPages = pages > 0 ? pages : 1;
-        const uint16_t para = pos["para"].as<uint16_t>();
-        if (para > 0) rich.paragraphIndex = para;
-        rich.xpath = pos["xpath"].as<const char*>() ? pos["xpath"].as<const char*>() : "";
-        LOG_DBG("KOSync", "Got rich position: spine=%u page=%u/%u para=%u", rich.spineIndex, rich.pageNumber,
-                rich.totalPages, para);
-        outProgress.position = std::move(rich);
-      }
-    }
-
-    http.end();
-    LOG_DBG("KOSync", "Got progress: %.2f%% at %s", outProgress.percentage * 100, outProgress.progress.c_str());
-    return OK;
-  }
-
-  http.end();
-  if (httpCode == 401) return AUTH_FAILED;
-  if (httpCode == 404) return NOT_FOUND;
-  return SERVER_ERROR;
+  return getProgressOver(http, url, documentHash, outProgress, false);
 #endif
 }
 
@@ -575,6 +620,21 @@ int putJson(const std::string& url, const std::string& body) {
 
 }  // namespace
 
+// A shared connection saves the second TLS handshake of a burst; without one
+// every call keeps its own connection, exactly as before.
+int KOReaderSyncClient::putJsonFor(const std::string& url, const std::string& body, Connection* connection) {
+#ifdef SIMULATOR
+  (void)connection;
+  return putJson(url, body);
+#else
+  if (!connection || !connection->impl) return putJson(url, body);
+  const int httpCode = putJsonOver(connection->impl->http, url, body, true);
+  lastHttpCode = httpCode;
+  lastTransportError = (httpCode < 0) ? httpCode : 0;
+  return httpCode;
+#endif
+}
+
 namespace {
 KOReaderSyncClient::Error putResult(const int httpCode) {
   if (httpCode <= 0) return KOReaderSyncClient::NETWORK_ERROR;
@@ -588,7 +648,7 @@ KOReaderSyncClient::Error putResult(const int httpCode) {
 }
 }  // namespace
 
-KOReaderSyncClient::Error KOReaderSyncClient::updateProgress(const KOReaderProgress& progress) {
+KOReaderSyncClient::Error KOReaderSyncClient::updateProgress(const KOReaderProgress& progress, Connection* connection) {
   lastHttpCode = 0;
   lastTransportError = 0;
   if (!KOREADER_STORE.hasCredentials()) {
@@ -606,12 +666,13 @@ KOReaderSyncClient::Error KOReaderSyncClient::updateProgress(const KOReaderProgr
     fillProgressJson(doc.to<JsonObject>(), progress);
     serializeJson(doc, body);
   }
-  const int httpCode = putJson(url, body);
+  const int httpCode = putJsonFor(url, body, connection);
   LOG_DBG("KOSync", "Update progress response: %d", httpCode);
   return putResult(httpCode);
 }
 
-KOReaderSyncClient::Error KOReaderSyncClient::updateProgressBatch(std::vector<KOReaderProgress>& items) {
+KOReaderSyncClient::Error KOReaderSyncClient::updateProgressBatch(std::vector<KOReaderProgress>& items,
+                                                                  Connection* connection) {
   lastHttpCode = 0;
   lastTransportError = 0;
   if (!KOREADER_STORE.hasCredentials()) return NO_CREDENTIALS;
@@ -631,7 +692,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::updateProgressBatch(std::vector<KO
   LOG_DBG("KOSync", "Batch progress: %u books, %u bytes (heap: %u)", static_cast<unsigned>(count),
           static_cast<unsigned>(body.size()), (unsigned)ESP.getFreeHeap());
   if (insufficientHeap()) return LOW_MEMORY;
-  const int httpCode = putJson(url, body);
+  const int httpCode = putJsonFor(url, body, connection);
   LOG_DBG("KOSync", "Batch progress response: %d", httpCode);
   // Stock KOSync and older CrossPoint Sync servers: one PUT per book instead.
   if (httpCode == 404) return BATCH_UNSUPPORTED;

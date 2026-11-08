@@ -28,6 +28,11 @@ class WifiCredentialStore : public PersistableStore<WifiCredentialStore> {
  private:
   std::vector<WifiCredential> credentials;
   std::string lastConnectedSsid;
+  // Last successful join's access point, for a fast join of the same SSID.
+  // Only meaningful while lastApSsid is the network being joined.
+  std::string lastApSsid;
+  uint8_t lastApBssid[6] = {};
+  uint8_t lastApChannel = 0;
   mutable std::mutex credentialMutex;
   mutable std::once_flag loadOnce;
 
@@ -64,6 +69,13 @@ class WifiCredentialStore : public PersistableStore<WifiCredentialStore> {
   // Last connected network
   void setLastConnectedSsid(const std::string& ssid);
   std::string getLastConnectedSsid() const;
+
+  // Access point that joined last, for WiFi.begin(ssid, pass, channel, bssid):
+  // a cached channel and BSSID skip the full-channel scan (~0.6 s measured).
+  // Persisted next to the credentials, so it also helps the sleep-time burst.
+  void setLastAp(const std::string& ssid, const uint8_t (&bssid)[6], uint8_t channel);
+  // False when the hint is for another SSID or the channel is unknown.
+  bool getLastAp(const std::string& ssid, uint8_t (&bssid)[6], uint8_t& channel) const;
 
   // Clear all credentials
   void clearAll();

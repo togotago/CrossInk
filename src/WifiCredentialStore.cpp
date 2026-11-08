@@ -26,6 +26,12 @@ void legacyDeobfuscate(std::string& data) {
 void WifiCredentialStore::toJson(JsonDocument& doc) const {
   std::lock_guard<std::mutex> lock(credentialMutex);
   doc["lastConnectedSsid"] = lastConnectedSsid;
+  if (!lastApSsid.empty() && lastApChannel > 0) {
+    doc["lastApSsid"] = lastApSsid;
+    doc["lastApChannel"] = lastApChannel;
+    JsonArray bssid = doc["lastApBssid"].to<JsonArray>();
+    for (const uint8_t octet : lastApBssid) bssid.add(octet);
+  }
 
   JsonArray arr = doc["credentials"].to<JsonArray>();
   for (const auto& cred : credentials) {
@@ -38,6 +44,17 @@ void WifiCredentialStore::toJson(JsonDocument& doc) const {
 bool WifiCredentialStore::fromJson(JsonVariantConst doc) {
   std::lock_guard<std::mutex> lock(credentialMutex);
   lastConnectedSsid = doc["lastConnectedSsid"] | "";
+  lastApSsid = doc["lastApSsid"] | "";
+  lastApChannel = 0;
+  memset(lastApBssid, 0, sizeof(lastApBssid));
+  const JsonArrayConst bssid = doc["lastApBssid"].as<JsonArrayConst>();
+  const uint8_t channel = doc["lastApChannel"] | (uint8_t)0;
+  if (!lastApSsid.empty() && channel > 0 && bssid.size() == 6) {
+    lastApChannel = channel;
+    for (size_t i = 0; i < 6; ++i) lastApBssid[i] = bssid[i] | (uint8_t)0;
+  } else {
+    lastApSsid.clear();
+  }
 
   // Tolerate a missing/invalid 'credentials' key (treat as empty list); only
   // a JSON parse error is fatal. A null JsonArray iterates zero times.
@@ -97,6 +114,9 @@ bool WifiCredentialStore::loadFromFile() {
     std::lock_guard<std::mutex> lock(credentialMutex);
     credentials.clear();
     lastConnectedSsid.clear();
+    lastApSsid.clear();
+    lastApChannel = 0;
+    memset(lastApBssid, 0, sizeof(lastApBssid));
   }
 
   const bool hasStoreFile = Storage.exists(getFilePath());
@@ -202,6 +222,11 @@ bool WifiCredentialStore::removeCredential(const std::string& ssid) {
     if (cred == credentials.end()) return false;
     credentials.erase(cred);
     if (ssid == lastConnectedSsid) lastConnectedSsid.clear();
+    if (ssid == lastApSsid) {
+      lastApSsid.clear();
+      lastApChannel = 0;
+      memset(lastApBssid, 0, sizeof(lastApBssid));
+    }
   }
   return saveToFile();
 }
@@ -275,6 +300,33 @@ void WifiCredentialStore::clearAll() {
     std::lock_guard<std::mutex> lock(credentialMutex);
     credentials.clear();
     lastConnectedSsid.clear();
+    lastApSsid.clear();
+    lastApChannel = 0;
+    memset(lastApBssid, 0, sizeof(lastApBssid));
   }
   saveToFile();
+}
+
+void WifiCredentialStore::setLastAp(const std::string& ssid, const uint8_t (&bssid)[6], const uint8_t channel) {
+  ensureLoaded();
+  if (ssid.empty() || channel == 0) return;
+
+  {
+    std::lock_guard<std::mutex> lock(credentialMutex);
+    // Every join would otherwise rewrite the file; only a moved AP changes it.
+    if (lastApSsid == ssid && lastApChannel == channel && memcmp(lastApBssid, bssid, sizeof(lastApBssid)) == 0) return;
+    lastApSsid = ssid;
+    lastApChannel = channel;
+    memcpy(lastApBssid, bssid, sizeof(lastApBssid));
+  }
+  saveToFile();
+}
+
+bool WifiCredentialStore::getLastAp(const std::string& ssid, uint8_t (&bssid)[6], uint8_t& channel) const {
+  ensureLoaded();
+  std::lock_guard<std::mutex> lock(credentialMutex);
+  if (lastApSsid.empty() || lastApSsid != ssid || lastApChannel == 0) return false;
+  memcpy(bssid, lastApBssid, sizeof(bssid));
+  channel = lastApChannel;
+  return true;
 }

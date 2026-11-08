@@ -102,6 +102,28 @@ class KOReaderSyncClient {
   // the whole body is held in RAM during the TLS request.
   static constexpr size_t MAX_PROGRESS_BATCH = 8;
 
+  /**
+   * One HTTPS connection shared by several progress requests, so a GET and the
+   * PUT of a sleep burst pay for one TLS handshake instead of one each
+   * (~0.4-0.8 s and a ~25-30 KB heap spike saved per request). Opaque: callers
+   * never include the transport header. The connection is opened on the first
+   * request and closed by the last end() or by the destructor. Pass one to
+   * getProgress/updateProgress/updateProgressBatch; without one, each call
+   * keeps its own connection, exactly as before.
+   */
+  class Connection {
+   public:
+    Connection();
+    ~Connection();
+    Connection(const Connection&) = delete;
+    Connection& operator=(const Connection&) = delete;
+
+   private:
+    friend class KOReaderSyncClient;
+    struct Impl;
+    Impl* impl;
+  };
+
   struct ChangesPage {
     uint32_t cursor = 0;  // where the next page starts
     bool more = false;
@@ -130,14 +152,15 @@ class KOReaderSyncClient {
    * @param outProgress Output: the progress data
    * @return OK on success, NOT_FOUND if no progress exists, error code on failure
    */
-  static Error getProgress(const std::string& documentHash, KOReaderProgress& outProgress);
+  static Error getProgress(const std::string& documentHash, KOReaderProgress& outProgress,
+                           Connection* connection = nullptr);
 
   /**
    * Update reading progress for a document.
    * @param progress The progress data to upload
    * @return OK on success, error code on failure
    */
-  static Error updateProgress(const KOReaderProgress& progress);
+  static Error updateProgress(const KOReaderProgress& progress, Connection* connection = nullptr);
 
   /**
    * PUT /api/v1/progress/batch (CrossPoint Sync): up to MAX_PROGRESS_BATCH
@@ -145,7 +168,7 @@ class KOReaderSyncClient {
    * before the request, so only the serialized body is alive during TLS).
    * @return OK, BATCH_UNSUPPORTED on servers without the route, or an error
    */
-  static Error updateProgressBatch(std::vector<KOReaderProgress>& items);
+  static Error updateProgressBatch(std::vector<KOReaderProgress>& items, Connection* connection = nullptr);
 
   /**
    * GET /api/v1/progress/changes?since=&limit=&device=: progress changed since
@@ -172,4 +195,8 @@ class KOReaderSyncClient {
 
   /** Transport-layer error from the last request (for diagnostics). */
   static int lastTransportError;
+
+ private:
+  // One PUT, over the caller's shared connection when there is one.
+  static int putJsonFor(const std::string& url, const std::string& body, Connection* connection);
 };

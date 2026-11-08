@@ -34,8 +34,28 @@ bool connectLastKnownNetwork(const uint32_t budgetMs) {
     return false;
   }
   WiFi.mode(WIFI_STA);
-  WiFi.begin(credential->ssid.c_str(), credential->password.c_str());
   const uint32_t start = millis();
+
+#ifndef SIMULATOR
+  // Remembering the channel and BSSID skips a full-channel scan (measured
+  // 798 ms -> 205 ms for association). The hint is only for this network, and
+  // a stale one costs its 2 s budget, never the whole connect.
+  uint8_t bssid[6] = {};
+  uint8_t channel = 0;
+  const bool hasCachedAp = WIFI_STORE.getLastAp(credential->ssid, bssid, channel);
+  if (AutoProgressSync::joinPhase(hasCachedAp, 0) == AutoProgressSync::JoinPhase::CachedAp) {
+    WiFi.begin(credential->ssid.c_str(), credential->password.c_str(), channel, bssid);
+    while (WiFi.status() != WL_CONNECTED && millis() - start < AutoProgressSync::FAST_JOIN_BUDGET_MS) delay(50);
+    if (WiFi.status() == WL_CONNECTED) {
+      LOG_INF(TAG, "WiFi joined the cached AP in %u ms", static_cast<unsigned>(millis() - start));
+      return true;
+    }
+    LOG_INF(TAG, "Cached AP did not answer; falling back to a normal join");
+    WiFi.disconnect(false, false, 1000);
+  }
+#endif
+
+  WiFi.begin(credential->ssid.c_str(), credential->password.c_str());
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - start >= budgetMs) {
       LOG_INF(TAG, "WiFi join timed out after %u ms", static_cast<unsigned>(budgetMs));
@@ -44,6 +64,14 @@ bool connectLastKnownNetwork(const uint32_t budgetMs) {
     delay(50);
   }
   LOG_INF(TAG, "WiFi joined in %u ms", static_cast<unsigned>(millis() - start));
+#ifndef SIMULATOR
+  // Learn the access point for the next burst, whatever path joined it.
+  uint8_t joinedBssid[6] = {};
+  const int joinedChannel = WiFi.channel();
+  if (WiFi.BSSID(joinedBssid) && joinedChannel > 0) {
+    WIFI_STORE.setLastAp(credential->ssid, joinedBssid, static_cast<uint8_t>(joinedChannel));
+  }
+#endif
   return true;
 }
 
@@ -68,14 +96,16 @@ void parkRemote(const KOReaderProgress& remote) {
 }
 
 // Sends the collected positions. A single book uses the plain PUT; several use
-// the CrossPoint batch route and fall back to one PUT per book elsewhere. Only
-// confirmed (2xx) books lose their pending bit.
-void flush(AutoProgressSync::Result& result, std::vector<KOReaderProgress>& batch, std::vector<std::string>& paths) {
+// the CrossPoint batch route, and a server without it gets one PUT per book.
+// Only confirmed (2xx) books lose their pending bit. All requests of one burst
+// share one TLS connection.
+void flush(AutoProgressSync::Result& result, std::vector<KOReaderProgress>& batch, std::vector<std::string>& paths,
+           KOReaderSyncClient::Connection& connection) {
   if (batch.empty()) return;
   const bool batchRoute = batch.size() > 1 && KOREADER_STORE.usesCrossPointSyncServer();
   if (!batchRoute) {
     for (size_t i = 0; i < paths.size(); ++i) {
-      const auto error = KOReaderSyncClient::updateProgress(batch[i]);
+      const auto error = KOReaderSyncClient::updateProgress(batch[i], &connection);
       if (error != KOReaderSyncClient::OK) {
         LOG_INF(TAG, "PUT failed (%s); keeping it pending", KOReaderSyncClient::errorString(error).c_str());
         continue;
@@ -87,7 +117,7 @@ void flush(AutoProgressSync::Result& result, std::vector<KOReaderProgress>& batc
     paths.clear();
     return;
   }
-  auto error = KOReaderSyncClient::updateProgressBatch(batch);
+  auto error = KOReaderSyncClient::updateProgressBatch(batch, &connection);
   // Consumed either way: never reused after the request.
   batch.clear();
   if (error != KOReaderSyncClient::OK) {
@@ -121,6 +151,9 @@ AutoProgressSync::Result runBurst() {
   std::vector<std::string> batchPaths;
   batch.reserve(KOReaderSyncClient::MAX_PROGRESS_BATCH);
   batchPaths.reserve(KOReaderSyncClient::MAX_PROGRESS_BATCH);
+  // One TLS session for the whole burst: the GET of each book and the PUT or
+  // batch PUT share it instead of paying a handshake per request.
+  KOReaderSyncClient::Connection connection;
   std::string path;
   uint8_t mask = 0;
   bool networkUp = false;
@@ -171,7 +204,7 @@ AutoProgressSync::Result runBurst() {
         result.budgetHit = true;
         break;
       }
-      const auto error = KOReaderSyncClient::getProgress(local.document, remote);
+      const auto error = KOReaderSyncClient::getProgress(local.document, remote, &connection);
       if (error == KOReaderSyncClient::OK) {
         hasRemote = true;
       } else if (error != KOReaderSyncClient::NOT_FOUND) {
@@ -189,7 +222,7 @@ AutoProgressSync::Result runBurst() {
         batch.push_back(std::move(local));
         // The batch route takes at most eight positions; flush a full batch
         // instead of growing it past what one request can send.
-        if (batch.size() >= KOReaderSyncClient::MAX_PROGRESS_BATCH) flush(result, batch, batchPaths);
+        if (batch.size() >= KOReaderSyncClient::MAX_PROGRESS_BATCH) flush(result, batch, batchPaths, connection);
         break;
       case AutoProgressSync::Decision::RemoteAhead:
         // The partner device is further ahead. Never move the server backwards;
@@ -206,7 +239,7 @@ AutoProgressSync::Result runBurst() {
   }
   cursor.end();
 
-  flush(result, batch, batchPaths);
+  flush(result, batch, batchPaths, connection);
   if (networkUp) wifiOff();
   return result;
 }
