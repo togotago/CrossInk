@@ -55,18 +55,27 @@ TEST(AutoProgressSyncBudget, ExhaustsAtTheCapAndWrapsAround) {
   EXPECT_TRUE(budgetExhausted(start, start + 8000u, 8000));
 }
 
-// BSSID cache fall-back: a remembered AP is tried first, then the normal join
-// takes over, so a roamed or re-channelled AP can never stop the burst.
-TEST(AutoProgressSyncJoin, UsesTheCachedAccessPointOnlyWithinItsBudget) {
-  EXPECT_EQ(joinPhase(true, 0), JoinPhase::CachedAp);
-  EXPECT_EQ(joinPhase(true, FAST_JOIN_BUDGET_MS - 1), JoinPhase::CachedAp);
-  EXPECT_EQ(joinPhase(true, FAST_JOIN_BUDGET_MS), JoinPhase::FullScan);
-  EXPECT_EQ(joinPhase(true, FAST_JOIN_BUDGET_MS + 1), JoinPhase::FullScan);
+// Join fail-fast: one attempt with one budget, and the two statuses the driver
+// reports after its own scan/association answer end it at once instead of
+// waiting out the budget. Anything else keeps waiting (association, then DHCP).
+TEST(AutoProgressSyncJoin, ConnectsOnTheConnectedStatus) {
+  EXPECT_EQ(joinSignal(WL_STATUS_CONNECTED), JoinSignal::Connected);
 }
 
-TEST(AutoProgressSyncJoin, AlwaysFallsBackWithoutACachedAccessPoint) {
-  EXPECT_EQ(joinPhase(false, 0), JoinPhase::FullScan);
-  EXPECT_EQ(joinPhase(false, FAST_JOIN_BUDGET_MS - 1), JoinPhase::FullScan);
+TEST(AutoProgressSyncJoin, EndsAtOnceWhenNoAccessPointIsInRange) {
+  EXPECT_EQ(joinSignal(WL_STATUS_NO_SSID_AVAIL), JoinSignal::NoApInRange);
+}
+
+TEST(AutoProgressSyncJoin, EndsAtOnceWhenTheAccessPointRefuses) {
+  EXPECT_EQ(joinSignal(WL_STATUS_CONNECT_FAILED), JoinSignal::Refused);
+}
+
+TEST(AutoProgressSyncJoin, KeepsWaitingForEveryOtherStatus) {
+  // WL_IDLE_STATUS, WL_SCAN_COMPLETED, WL_CONNECTION_LOST, WL_DISCONNECTED,
+  // WL_STOPPED: none of these are the driver's final answer.
+  for (const int status : {0, 2, 5, 6, 7}) {
+    EXPECT_EQ(joinSignal(status), JoinSignal::Waiting) << status;
+  }
 }
 
 // Sync-boot gate: the burst runs in its own boot, so a device that would skip

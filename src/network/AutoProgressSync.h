@@ -26,8 +26,6 @@ namespace AutoProgressSync {
 constexpr uint32_t BURST_BUDGET_MS = 8000;
 // Association plus DHCP for the last saved network.
 constexpr uint32_t CONNECT_BUDGET_MS = 5000;
-// The cached access point gets this long before a normal join takes over.
-constexpr uint32_t FAST_JOIN_BUDGET_MS = 2000;
 // Below this the burst is skipped; the same floor the plugin sleep hook uses.
 constexpr uint8_t MIN_BATTERY_PERCENT = 20;
 // A sync boot that never reaches deep sleep must not loop. The counter is RTC
@@ -82,16 +80,36 @@ inline PendingAction pendingActionFor(const Decision decision) {
   return decision == Decision::Upload ? PendingAction::UploadAndClearOnSuccess : PendingAction::ClearNow;
 }
 
-enum class JoinPhase : uint8_t {
-  CachedAp,  // scan starting from the remembered channel (no BSSID pin)
-  FullScan,  // a normal join: the AP roamed, changed channel, or was never seen
+// wl_status_t values from Arduino's WiFiType.h, repeated so the rule below can
+// be tested on the host, whose build has no Arduino headers. AutoProgressSync.cpp
+// static-asserts them against the real enum.
+constexpr int WL_STATUS_NO_SSID_AVAIL = 1;
+constexpr int WL_STATUS_CONNECTED = 3;
+constexpr int WL_STATUS_CONNECT_FAILED = 4;
+
+enum class JoinSignal : uint8_t {
+  Waiting,      // starting, associating, or waiting for DHCP
+  Connected,    // associated and has an address
+  NoApInRange,  // the driver's scan found no access point for this SSID
+  Refused,      // the access point answered and refused, or association failed
 };
 
-// A remembered AP is tried first (one scan avoided), but only for its budget:
-// mesh and band-steering networks move a client between APs, so the fallback
-// must always exist.
-inline JoinPhase joinPhase(const bool hasCachedAp, const uint32_t elapsedMs) {
-  return hasCachedAp && elapsedMs < FAST_JOIN_BUDGET_MS ? JoinPhase::CachedAp : JoinPhase::FullScan;
+// A join is one attempt with one budget: a remembered channel is only a
+// scan-start hint, so there is nothing to retry differently. These two statuses
+// are terminal and end the attempt at once instead of waiting out the budget:
+// the driver sets them after its own scan/association answer, so "out and
+// about" costs a scan (~1-1.5 s), not the full budget.
+inline JoinSignal joinSignal(const int wlStatus) {
+  switch (wlStatus) {
+    case WL_STATUS_CONNECTED:
+      return JoinSignal::Connected;
+    case WL_STATUS_NO_SSID_AVAIL:
+      return JoinSignal::NoApInRange;
+    case WL_STATUS_CONNECT_FAILED:
+      return JoinSignal::Refused;
+    default:
+      return JoinSignal::Waiting;
+  }
 }
 
 struct Result {
@@ -120,6 +138,12 @@ void noteSyncBootTotal(uint32_t totalMs);
 // stores pushPending() gates on, so a device with the setting off, no
 // credentials, a low battery or nothing pending never pays a boot.
 bool wantsSleepSync(uint8_t batteryPercent, uint32_t attempts);
+
+// Joins the last saved network with one WiFi.begin() and one overall budget,
+// ending at once when the driver reports no AP in range or a refusal. Shared by
+// the sleep burst and the manual sync's quick connect. Leaves the radio up on
+// success and in station mode on failure; the caller owns both.
+bool joinKnownNetwork(uint32_t budgetMs);
 
 // batteryPercent is the same reading the plugin sleep hook uses (main.cpp).
 // syncBoot marks the SD trace line so a burst's origin is unambiguous.

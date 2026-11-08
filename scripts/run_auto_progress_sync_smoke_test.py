@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIRST = hashlib.md5(b'first.epub').hexdigest()
 SECOND = hashlib.md5(b'second.EPUB').hexdigest()
 MODES = ['upload', 'batch', 'batch-unsupported', 'remote-ahead', 'server-error', 'no-network',
-         'parked-ahead-no-network']
+         'no-network-failfast', 'parked-ahead-no-network']
 
 
 def describe(requests):
@@ -109,7 +109,7 @@ def main():
                     CROSSINK_AUTOSYNC_TEST_SERVER=f'http://127.0.0.1:{server.server_port}',
                     CROSSINK_AUTOSYNC_TEST_MODE=mode,
                 )
-                if mode in ('no-network', 'parked-ahead-no-network'):
+                if mode in ('no-network', 'no-network-failfast', 'parked-ahead-no-network'):
                     # No join can succeed, so any attempt shows up as a timeout
                     # in the log and as a NoNetwork result.
                     env['CROSSPOINT_SIM_WIFI_CONNECT'] = 'fail'
@@ -125,7 +125,8 @@ def main():
                 sleep_line = next((l for l in log.splitlines() if 'Sleep sync' in l), '')
                 assert sleep_line, log[-4000:]
                 pending = (fs / '.crosspoint/sync_pending.bin').read_bytes()
-                joined = 'WiFi join timed out' in log or 'WiFi joined' in log
+                joined = any(marker in log for marker in ('WiFi join timed out', 'WiFi joined',
+                                                          'Wi-Fi refused', 'No known Wi-Fi in range'))
 
                 if mode == 'upload':
                     assert len(gets) == 1 and gets[0].startswith(f'/syncs/progress/{FIRST}'), requests
@@ -173,6 +174,14 @@ def main():
                     # next sleep or a manual sync.
                     assert not requests, requests
                     assert joined, log[-4000:]
+                    assert b'/read/first.epub' in pending, 'pending bit lost without a network'
+                    assert 'no network' in sleep_line, sleep_line
+                elif mode == 'no-network-failfast':
+                    # A refused access point ends the attempt on the driver's
+                    # answer instead of waiting out the 5 s join budget.
+                    assert not requests, requests
+                    assert 'Wi-Fi refused after' in log, log[-4000:]
+                    assert 'WiFi join timed out' not in log, log[-4000:]
                     assert b'/read/first.epub' in pending, 'pending bit lost without a network'
                     assert 'no network' in sleep_line, sleep_line
                 else:  # parked-ahead-no-network

@@ -80,6 +80,12 @@ void traceFlush() {
 // manual sync path allows.
 constexpr uint32_t NTP_BUDGET_MS = 2000;
 
+// The pure join rule repeats the wl_status_t values so the host tests need no
+// Arduino headers; keep the copies honest.
+static_assert(static_cast<int>(WL_NO_SSID_AVAIL) == AutoProgressSync::WL_STATUS_NO_SSID_AVAIL);
+static_assert(static_cast<int>(WL_CONNECTED) == AutoProgressSync::WL_STATUS_CONNECTED);
+static_assert(static_cast<int>(WL_CONNECT_FAILED) == AutoProgressSync::WL_STATUS_CONNECT_FAILED);
+
 bool connectLastKnownNetwork(const uint32_t budgetMs) {
   if (hasActiveStationWifiConnection()) return true;
   const auto credential = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
@@ -91,38 +97,47 @@ bool connectLastKnownNetwork(const uint32_t budgetMs) {
   const uint32_t start = millis();
 
 #ifndef SIMULATOR
+  uint8_t cachedChannel = 0;
   // The remembered channel is a scan-start hint, not a pinned AP: with
   // bssid_set=0 ESP-IDF still scans, starting on (and preferring) that channel.
   // Pinning the cached BSSID instead made this a directed auth that failed 3 of
-  // 3 times on the device and burned its full 2 s budget on every burst — one
-  // SSID commonly maps to several BSSIDs (mesh, repeaters, band steering) and
-  // an AP can also change channel. The channel hint keeps the fast join without
-  // the dead end, and the normal join below remains the fallback.
+  // 3 times on the device and burned its full budget on every burst — one SSID
+  // commonly maps to several BSSIDs (mesh, repeaters, band steering) and an AP
+  // can also change channel.
   uint8_t cachedBssid[6] = {};
-  uint8_t cachedChannel = 0;
-  const bool hasCachedAp = WIFI_STORE.getLastAp(credential->ssid, cachedBssid, cachedChannel);
-  if (AutoProgressSync::joinPhase(hasCachedAp, 0) == AutoProgressSync::JoinPhase::CachedAp && cachedChannel > 0) {
-    WiFi.begin(credential->ssid.c_str(), credential->password.c_str(), cachedChannel, nullptr);
-    while (WiFi.status() != WL_CONNECTED && millis() - start < AutoProgressSync::FAST_JOIN_BUDGET_MS) delay(50);
-    if (WiFi.status() == WL_CONNECTED) {
-      ALOG(LOG_INF, "WiFi joined the cached channel in %u ms", static_cast<unsigned>(millis() - start));
-      return true;
-    }
-    ALOG(LOG_INF, "Cached channel did not answer; falling back to a normal join");
-    // No disconnect here: WiFi.begin() rewrites the whole station config, and
-    // the disconnect can burn a second the retry needs.
-  }
+  if (!WIFI_STORE.getLastAp(credential->ssid, cachedBssid, cachedChannel)) cachedChannel = 0;
+#endif
+  // One attempt. Aborting a join that is still associating and restarting it
+  // throws away the association in flight, which is what made a cold-radio
+  // start look like a dead end; the driver's own scan already covers a moved AP.
+#ifdef SIMULATOR
+  WiFi.begin(credential->ssid.c_str(), credential->password.c_str());
+#else
+  WiFi.begin(credential->ssid.c_str(), credential->password.c_str(), cachedChannel, nullptr);
 #endif
 
-  WiFi.begin(credential->ssid.c_str(), credential->password.c_str());
-  while (WiFi.status() != WL_CONNECTED) {
-    if (millis() - start >= budgetMs) {
-      ALOG(LOG_INF, "WiFi join timed out after %u ms", static_cast<unsigned>(budgetMs));
-      return false;
+  for (;;) {
+    const uint32_t elapsed = millis() - start;
+    switch (AutoProgressSync::joinSignal(static_cast<int>(WiFi.status()))) {
+      case AutoProgressSync::JoinSignal::Connected:
+        break;
+      case AutoProgressSync::JoinSignal::NoApInRange:
+        ALOG(LOG_INF, "No known Wi-Fi in range after %u ms", static_cast<unsigned>(elapsed));
+        return false;
+      case AutoProgressSync::JoinSignal::Refused:
+        ALOG(LOG_INF, "Wi-Fi refused after %u ms", static_cast<unsigned>(elapsed));
+        return false;
+      case AutoProgressSync::JoinSignal::Waiting:
+        if (elapsed < budgetMs) {
+          delay(50);
+          continue;
+        }
+        ALOG(LOG_INF, "WiFi join timed out after %u ms", static_cast<unsigned>(budgetMs));
+        return false;
     }
-    delay(50);
+    ALOG(LOG_INF, "WiFi joined in %u ms", static_cast<unsigned>(elapsed));
+    break;
   }
-  ALOG(LOG_INF, "WiFi joined in %u ms", static_cast<unsigned>(millis() - start));
 #ifndef SIMULATOR
   // Learn the access point for the next burst, whatever path joined it.
   uint8_t joinedBssid[6] = {};
@@ -380,6 +395,8 @@ void AutoProgressSync::noteSyncBootTotal(const uint32_t totalMs) {
   traceAppend("boot=sync done at %u ms", static_cast<unsigned>(totalMs));
   traceFlush();
 }
+
+bool AutoProgressSync::joinKnownNetwork(const uint32_t budgetMs) { return connectLastKnownNetwork(budgetMs); }
 
 bool AutoProgressSync::wantsSleepSync(const uint8_t batteryPercent, const uint32_t attempts) {
   // Only progress entries bring the radio up here; a stats-only entry belongs
