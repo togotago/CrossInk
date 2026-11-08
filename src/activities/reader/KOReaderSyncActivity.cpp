@@ -5,6 +5,7 @@
 #include <I18n.h>
 #include <Logging.h>
 #include <Memory.h>
+#include <TrustedTime.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
@@ -304,8 +305,11 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
   }
   requestUpdate(true);
 
-  // The folder batch synchronizes time once, with its first book.
-  if (!folderSync || includeGlobalStats) syncTimeWithNTP();
+  // The network boot already adopted the RTC into trustedtime, and the progress
+  // PUT carries no timestamp, so a trusted clock needs no blocking NTP. Stats
+  // and clippings read timestamps already recorded in their files; only an
+  // unknown clock (fresh RTC) is worth the exchange.
+  if (trustedtime::trustedNow() == 0) syncTimeWithNTP();
 
   {
     RenderLock lock(*this);
