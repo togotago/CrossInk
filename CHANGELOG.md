@@ -2,6 +2,7 @@
 
 ### Added
 
+- Push pending reading positions to the sync server automatically when the reader goes to sleep, behind the new Auto sync on sleep setting under Settings → Sync Server (off by default). Wi-Fi is only joined when a book actually needs the server, and a position behind another device's is parked for the next open instead of being uploaded.
 - Discover and upload static `.otf` fonts on ESP32-S3 readers, including OpenType CFF fonts and CFF files named `.ttf`, from SD or the Fonts web upload. Variable fonts and font collections remain unsupported (CrossPoint #3646, #3717).
 - Assign Select Chapter to shortcuts, Quick Actions, or touch gestures to open the chapter list directly in EPUB and XTC books.
 - Track active reading seconds by local day, sync daily reading time to CrossPoint Sync, and show today's total and 7-day average on the This Device reading stats page.
