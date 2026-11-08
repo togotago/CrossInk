@@ -35,6 +35,7 @@
 #include "components/TouchHeaderBackButton.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
+#include "network/AutoProgressSync.h"
 #include "network/ClippingsUpload.h"
 #include "network/ReadingSyncUpload.h"
 #include "network/WifiUtils.h"
@@ -843,6 +844,15 @@ void KOReaderSyncActivity::onEnter() {
 
   // Check if already connected (e.g. from settings page auth)
   if (hasActiveStationWifiConnection()) {
+    onWifiSelectionComplete(true);
+    return;
+  }
+
+  // Quick connect first: the remembered network joins in one attempt, with no
+  // scan list and no Wi-Fi screen. A failure (nothing in range, refused) falls
+  // back to the list below, which is how a phone hotspot is picked when away.
+  if (AutoProgressSync::joinKnownNetwork(AutoProgressSync::CONNECT_BUDGET_MS)) {
+    LOG_INF("KOSync", "Joined the saved network without the Wi-Fi list");
     onWifiSelectionComplete(true);
     return;
   }
