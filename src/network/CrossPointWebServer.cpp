@@ -315,6 +315,12 @@ String wsLastCompleteName;
 size_t wsLastCompleteSize = 0;
 unsigned long wsLastCompleteAt = 0;
 
+#ifndef WEBSOCKETS_SERVER_CLIENT_MAX
+// The simulator's WebSocketsServer stub has no slot-count macro; match the
+// device library's default so the idle-slot table sizes the same way.
+constexpr uint8_t WEBSOCKETS_SERVER_CLIENT_MAX = 5;
+#endif
+
 // millis() of each client's last event, 0 for a free slot.
 uint32_t wsLastActivity[WEBSOCKETS_SERVER_CLIENT_MAX] = {};
 
