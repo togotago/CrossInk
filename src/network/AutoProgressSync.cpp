@@ -1,0 +1,244 @@
+#include "AutoProgressSync.h"
+
+#include <Arduino.h>
+#include <FsHelpers.h>
+#include <HalStorage.h>
+#include <Logging.h>
+#include <TrustedTime.h>
+#include <WiFi.h>
+
+#include <string>
+#include <vector>
+
+#include "KOReaderCredentialStore.h"
+#include "ReadingSyncUpload.h"
+#include "WifiCredentialStore.h"
+#include "WifiPowerSaveGuard.h"
+#include "WifiUtils.h"
+#include "sync/SyncParked.h"
+#include "sync/SyncPending.h"
+
+namespace {
+
+constexpr char TAG[] = "AutoSync";
+// Bounded clock work: an untrusted clock only skews event timestamps, and the
+// upload carries no timestamp of its own, so this is never worth the 5 s the
+// manual sync path allows.
+constexpr uint32_t NTP_BUDGET_MS = 2000;
+
+bool connectLastKnownNetwork(const uint32_t budgetMs) {
+  if (hasActiveStationWifiConnection()) return true;
+  const auto credential = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
+  if (!credential) {
+    LOG_INF(TAG, "No saved network for the last SSID");
+    return false;
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(credential->ssid.c_str(), credential->password.c_str());
+  const uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start >= budgetMs) {
+      LOG_INF(TAG, "WiFi join timed out after %u ms", static_cast<unsigned>(budgetMs));
+      return false;
+    }
+    delay(50);
+  }
+  LOG_INF(TAG, "WiFi joined in %u ms", static_cast<unsigned>(millis() - start));
+  return true;
+}
+
+void wifiOff() {
+  WiFi.disconnect(false);
+  delay(100);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+}
+
+// Keep the newest remote position this reader saw for a book it cannot apply:
+// the next open offers it through KeptPosition, as the bulk pull does.
+void parkRemote(const KOReaderProgress& remote) {
+  KOReaderProgressChange change;
+  change.document = remote.document;
+  change.percentage = remote.percentage;
+  change.progress = remote.progress;
+  change.position = remote.position;
+  change.device = remote.device;
+  change.timestamp = remote.timestamp;
+  if (!SyncParked::park(change)) LOG_ERR(TAG, "Could not park the remote position");
+}
+
+// Sends the collected positions. A single book uses the plain PUT; several use
+// the CrossPoint batch route and fall back to one PUT per book elsewhere. Only
+// confirmed (2xx) books lose their pending bit.
+void flush(AutoProgressSync::Result& result, std::vector<KOReaderProgress>& batch, std::vector<std::string>& paths) {
+  if (batch.empty()) return;
+  const bool batchRoute = batch.size() > 1 && KOREADER_STORE.usesCrossPointSyncServer();
+  if (!batchRoute) {
+    for (size_t i = 0; i < paths.size(); ++i) {
+      const auto error = KOReaderSyncClient::updateProgress(batch[i]);
+      if (error != KOReaderSyncClient::OK) {
+        LOG_INF(TAG, "PUT failed (%s); keeping it pending", KOReaderSyncClient::errorString(error).c_str());
+        continue;
+      }
+      SyncPending::clear(paths[i], SyncPending::PROGRESS_BIT);
+      ++result.pushed;
+    }
+    batch.clear();
+    paths.clear();
+    return;
+  }
+  auto error = KOReaderSyncClient::updateProgressBatch(batch);
+  // Consumed either way: never reused after the request.
+  batch.clear();
+  if (error != KOReaderSyncClient::OK) {
+    // Nothing is inferred: the books stay pending for the next sleep or manual
+    // sync, which learns the batch route's absence properly.
+    LOG_INF(TAG, "Batch PUT failed (%s); keeping them pending", KOReaderSyncClient::errorString(error).c_str());
+    result.failed += static_cast<uint8_t>(paths.size());
+    paths.clear();
+    return;
+  }
+  for (const auto& path : paths) {
+    SyncPending::clear(path, SyncPending::PROGRESS_BIT);
+    ++result.pushed;
+  }
+  paths.clear();
+}
+
+AutoProgressSync::Result runBurst() {
+  AutoProgressSync::Result result;
+  // PS_NONE for the whole burst: modem power save during TLS is a known cause
+  // of intermittent handshake failures. The guard restores the previous mode.
+  WifiPowerSaveGuard powerSave;
+  const uint32_t start = millis();
+  SyncPending::Cursor cursor;
+  if (!cursor.begin()) {
+    LOG_ERR(TAG, "Pending list unreadable; skipping");
+    return result;
+  }
+
+  std::vector<KOReaderProgress> batch;
+  std::vector<std::string> batchPaths;
+  batch.reserve(KOReaderSyncClient::MAX_PROGRESS_BATCH);
+  batchPaths.reserve(KOReaderSyncClient::MAX_PROGRESS_BATCH);
+  std::string path;
+  uint8_t mask = 0;
+  bool networkUp = false;
+  while (cursor.next(path, mask) == SyncPending::Cursor::Step::Entry) {
+    if (!(mask & SyncPending::PROGRESS_BIT) || !FsHelpers::hasEpubExtension(path)) continue;
+    if (!Storage.exists(path.c_str())) {
+      // Moved or deleted outside the reader: nothing to map. Keep the bit.
+      LOG_INF(TAG, "Pending book missing; keeping it pending: %s", path.c_str());
+      ++result.failed;
+      continue;
+    }
+    if (AutoProgressSync::budgetExhausted(start, millis())) {
+      result.budgetHit = true;
+      break;
+    }
+    if (!networkUp) {
+      if (!connectLastKnownNetwork(AutoProgressSync::CONNECT_BUDGET_MS)) {
+        result.status = AutoProgressSync::Result::Status::NoNetwork;
+        break;
+      }
+      if (trustedtime::trustedNow() == 0) trustedtime::syncNow(NTP_BUDGET_MS);
+      networkUp = true;
+      result.status = AutoProgressSync::Result::Status::Ran;
+    }
+
+    KOReaderProgress local;
+    if (!ReadingSyncUpload::prepareProgress(path, local)) {
+      // No usable saved position (unread, or failed to map): keep the bit, as
+      // the manual sync does.
+      LOG_INF(TAG, "No usable saved position; keeping it pending: %s", path.c_str());
+      ++result.failed;
+      continue;
+    }
+
+    SyncParked::Entry parked;
+    KOReaderProgress remote;
+    bool hasRemote = false;
+    bool fromParked = false;
+    if (SyncParked::find(local.document, parked)) {
+      // The parked position is the newest this reader saw; compare it instead
+      // of a GET so it is never overwritten blindly.
+      remote = parked.toProgress(local.document);
+      hasRemote = true;
+      fromParked = true;
+      LOG_INF(TAG, "Comparing with a parked remote position: %s", path.c_str());
+    } else {
+      if (AutoProgressSync::budgetExhausted(start, millis())) {
+        result.budgetHit = true;
+        break;
+      }
+      const auto error = KOReaderSyncClient::getProgress(local.document, remote);
+      if (error == KOReaderSyncClient::OK) {
+        hasRemote = true;
+      } else if (error != KOReaderSyncClient::NOT_FOUND) {
+        LOG_INF(TAG, "GET failed (%s); keeping it pending", KOReaderSyncClient::errorString(error).c_str());
+        ++result.failed;
+        // A dead transport or exhausted heap fails every remaining book too.
+        if (error == KOReaderSyncClient::NETWORK_ERROR || error == KOReaderSyncClient::LOW_MEMORY) break;
+        continue;
+      }
+    }
+
+    switch (AutoProgressSync::decide(local.percentage, hasRemote, remote.percentage)) {
+      case AutoProgressSync::Decision::Upload:
+        batchPaths.push_back(path);
+        batch.push_back(std::move(local));
+        // The batch route takes at most eight positions; flush a full batch
+        // instead of growing it past what one request can send.
+        if (batch.size() >= KOReaderSyncClient::MAX_PROGRESS_BATCH) flush(result, batch, batchPaths);
+        break;
+      case AutoProgressSync::Decision::RemoteAhead:
+        // The partner device is further ahead. Never move the server backwards;
+        // leave this change pending and offer the remote position on the
+        // book's next open.
+        if (hasRemote && !fromParked) parkRemote(remote);
+        ++result.parked;
+        break;
+      case AutoProgressSync::Decision::InSync:
+        SyncPending::clear(path, SyncPending::PROGRESS_BIT);
+        ++result.inSync;
+        break;
+    }
+  }
+  cursor.end();
+
+  flush(result, batch, batchPaths);
+  if (networkUp) wifiOff();
+  return result;
+}
+
+}  // namespace
+
+AutoProgressSync::Result AutoProgressSync::pushPending(const uint8_t batteryPercent) {
+  Result result;
+  if (!KOREADER_STORE.getAutoSyncProgress()) return result;
+  if (!KOREADER_STORE.hasCredentials()) {
+    LOG_DBG(TAG, "No sync credentials; skipping");
+    return result;
+  }
+  if (batteryPercent < MIN_BATTERY_PERCENT) {
+    LOG_INF(TAG, "Battery %u%% is below the sync floor; keeping positions pending",
+            static_cast<unsigned>(batteryPercent));
+    return result;
+  }
+  if (SyncPending::count() == 0) {
+    LOG_DBG(TAG, "Nothing pending; skipping");
+    return result;
+  }
+
+  const uint32_t start = millis();
+  result = runBurst();
+  // One line per sleep, whatever the outcome: this is the only record of what
+  // an unattended burst did.
+  LOG_INF(TAG, "Sleep sync %s: pushed=%u parked=%u in-sync=%u failed=%u budget=%s elapsed=%u ms heap=%u maxalloc=%u",
+          result.status == Result::Status::Ran ? "ran" : "no network", static_cast<unsigned>(result.pushed),
+          static_cast<unsigned>(result.parked), static_cast<unsigned>(result.inSync),
+          static_cast<unsigned>(result.failed), result.budgetHit ? "hit" : "ok",
+          static_cast<unsigned>(millis() - start), static_cast<unsigned>(ESP.getFreeHeap()),
+          static_cast<unsigned>(ESP.getMaxAllocHeap()));
+  return result;
+}

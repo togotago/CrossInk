@@ -23,6 +23,7 @@
 #include <SPI.h>
 #include <TrustedTime.h>
 
+#include "network/AutoProgressSync.h"
 #include "util/PluginEvents.h"
 #if !defined(SIMULATOR) && !FREEINK_MCU_C3
 #include <XteinkDetect.h>
@@ -1177,6 +1178,15 @@ void enterDeepSleep(bool fromTimeout) {
   // Last chance to sample: startDeepSleep() cuts the SD rail on X3, so nothing
   // can be written again until the next wake.
   BatteryDiagnosticLog::record(BatteryDiagnosticLog::Event::Sleep, BoardConfig::ACTIVE.name);
+
+  // Push pending reading positions now: the sleep screen is already on the
+  // panel, the reader has released its memory, and SD is still mounted. This
+  // runs for the idle-timeout sleep too — with nothing pending it returns at
+  // once, and a change skipped here would only wait for the next sleep. Bounded
+  // and best-effort: a book that fails keeps its pending bit for the next sleep
+  // or a manual sync.
+  AutoProgressSync::pushPending(static_cast<uint8_t>(powerManager.getBatteryPercentage()));
+
   // All sleep-time file writes are complete. Stop SDMMC before the power path
   // cuts peripheral rails and isolates the bus pads; SPI boards are a no-op.
   libraryScanSleepToken.save(!library::libraryIndexNeedsRefresh());
