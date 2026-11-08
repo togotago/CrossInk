@@ -7,7 +7,14 @@
 class WifiPowerSaveGuard final {
  public:
 #ifndef SIMULATOR
-  WifiPowerSaveGuard() {
+  WifiPowerSaveGuard() { arm(); }
+
+  // Switches modem power save off. Called by the constructor; a caller that
+  // may not touch the radio at all can construct the guard and arm it only
+  // when it actually starts a network request.
+  void arm() {
+    if (armed_) return;
+    armed_ = true;
     if (esp_wifi_get_ps(&previousMode_) == ESP_OK) {
       restorePreviousMode_ = true;
     }
@@ -21,6 +28,7 @@ class WifiPowerSaveGuard final {
   }
 #else
   WifiPowerSaveGuard() = default;
+  void arm() {}
   ~WifiPowerSaveGuard() = default;
 #endif
 
@@ -31,5 +39,6 @@ class WifiPowerSaveGuard final {
 #ifndef SIMULATOR
   wifi_ps_type_t previousMode_ = WIFI_PS_MIN_MODEM;
   bool restorePreviousMode_ = false;
+  bool armed_ = false;
 #endif
 };

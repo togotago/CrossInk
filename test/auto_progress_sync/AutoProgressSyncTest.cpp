@@ -34,11 +34,14 @@ TEST(AutoProgressSyncDecision, TreatsPositionsWithinPointOnePercentAsEqual) {
   EXPECT_EQ(decide(0.5000f, true, 0.5011f), Decision::RemoteAhead);
 }
 
-// Pending-bit handling: only a position the server is known to hold is cleared.
-TEST(AutoProgressSyncPending, ClearsOnlyWhenTheServerHasThePosition) {
+// Pending-bit handling: an upload clears on a 2xx, and a decision the server
+// has already settled clears at once. A book behind the server is parked for
+// its next open and cleared, because the Smart rule would never upload it; the
+// next progress save re-marks it.
+TEST(AutoProgressSyncPending, ClearsUnlessAnUploadMustSucceed) {
   EXPECT_EQ(pendingActionFor(Decision::Upload), PendingAction::UploadAndClearOnSuccess);
   EXPECT_EQ(pendingActionFor(Decision::InSync), PendingAction::ClearNow);
-  EXPECT_EQ(pendingActionFor(Decision::RemoteAhead), PendingAction::KeepPending);
+  EXPECT_EQ(pendingActionFor(Decision::RemoteAhead), PendingAction::ClearNow);
 }
 
 TEST(AutoProgressSyncBudget, ExhaustsAtTheCapAndWrapsAround) {

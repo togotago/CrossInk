@@ -137,8 +137,9 @@ void flush(AutoProgressSync::Result& result, std::vector<KOReaderProgress>& batc
 
 AutoProgressSync::Result runBurst() {
   AutoProgressSync::Result result;
-  // PS_NONE for the whole burst: modem power save during TLS is a known cause
-  // of intermittent handshake failures. The guard restores the previous mode.
+  // Modem power save during TLS is a known cause of intermittent handshake
+  // failures, so it is switched off for the burst. The guard is only armed when
+  // a request is actually needed; the destructor restores the previous mode.
   WifiPowerSaveGuard powerSave;
   const uint32_t start = millis();
   SyncPending::Cursor cursor;
@@ -154,29 +155,40 @@ AutoProgressSync::Result runBurst() {
   // One TLS session for the whole burst: the GET of each book and the PUT or
   // batch PUT share it instead of paying a handshake per request.
   KOReaderSyncClient::Connection connection;
+
+  // The radio is joined at most once per burst, and only when a GET or PUT is
+  // really needed: a book whose parked remote is already ahead is settled from
+  // the SD card alone, so it must never cost a Wi-Fi join.
+  enum class Network : uint8_t { NotTried, Up, Failed };
+  Network network = Network::NotTried;
+  const auto ensureNetwork = [&]() {
+    if (network == Network::Up) return true;
+    if (network == Network::Failed) return false;  // one attempt per burst
+    powerSave.arm();
+    if (!connectLastKnownNetwork(AutoProgressSync::CONNECT_BUDGET_MS)) {
+      network = Network::Failed;
+      result.status = AutoProgressSync::Result::Status::NoNetwork;
+      return false;
+    }
+    if (trustedtime::trustedNow() == 0) trustedtime::syncNow(NTP_BUDGET_MS);
+    network = Network::Up;
+    return true;
+  };
+
   std::string path;
   uint8_t mask = 0;
-  bool networkUp = false;
+  bool handled = false;
   while (cursor.next(path, mask) == SyncPending::Cursor::Step::Entry) {
     if (!(mask & SyncPending::PROGRESS_BIT) || !FsHelpers::hasEpubExtension(path)) continue;
+    if (AutoProgressSync::budgetExhausted(start, millis())) {
+      result.budgetHit = true;
+      break;
+    }
     if (!Storage.exists(path.c_str())) {
       // Moved or deleted outside the reader: nothing to map. Keep the bit.
       LOG_INF(TAG, "Pending book missing; keeping it pending: %s", path.c_str());
       ++result.failed;
       continue;
-    }
-    if (AutoProgressSync::budgetExhausted(start, millis())) {
-      result.budgetHit = true;
-      break;
-    }
-    if (!networkUp) {
-      if (!connectLastKnownNetwork(AutoProgressSync::CONNECT_BUDGET_MS)) {
-        result.status = AutoProgressSync::Result::Status::NoNetwork;
-        break;
-      }
-      if (trustedtime::trustedNow() == 0) trustedtime::syncNow(NTP_BUDGET_MS);
-      networkUp = true;
-      result.status = AutoProgressSync::Result::Status::Ran;
     }
 
     KOReaderProgress local;
@@ -194,7 +206,7 @@ AutoProgressSync::Result runBurst() {
     bool fromParked = false;
     if (SyncParked::find(local.document, parked)) {
       // The parked position is the newest this reader saw; compare it instead
-      // of a GET so it is never overwritten blindly.
+      // of a GET so it is never overwritten blindly, and without a radio.
       remote = parked.toProgress(local.document);
       hasRemote = true;
       fromParked = true;
@@ -203,6 +215,10 @@ AutoProgressSync::Result runBurst() {
       if (AutoProgressSync::budgetExhausted(start, millis())) {
         result.budgetHit = true;
         break;
+      }
+      if (!ensureNetwork()) {
+        ++result.failed;
+        continue;
       }
       const auto error = KOReaderSyncClient::getProgress(local.document, remote, &connection);
       if (error == KOReaderSyncClient::OK) {
@@ -216,32 +232,43 @@ AutoProgressSync::Result runBurst() {
       }
     }
 
-    switch (
-        AutoProgressSync::pendingActionFor(AutoProgressSync::decide(local.percentage, hasRemote, remote.percentage))) {
+    const auto decision = AutoProgressSync::decide(local.percentage, hasRemote, remote.percentage);
+    handled = true;
+    switch (AutoProgressSync::pendingActionFor(decision)) {
       case AutoProgressSync::PendingAction::UploadAndClearOnSuccess:
+        if (!ensureNetwork()) {
+          ++result.failed;
+          break;
+        }
         batchPaths.push_back(path);
         batch.push_back(std::move(local));
         // The batch route takes at most eight positions; flush a full batch
         // instead of growing it past what one request can send.
         if (batch.size() >= KOReaderSyncClient::MAX_PROGRESS_BATCH) flush(result, batch, batchPaths, connection);
         break;
-      case AutoProgressSync::PendingAction::KeepPending:
-        // The partner device is further ahead. Never move the server backwards;
-        // leave this change pending and offer the remote position on the
-        // book's next open.
-        if (hasRemote && !fromParked) parkRemote(remote);
-        ++result.parked;
-        break;
       case AutoProgressSync::PendingAction::ClearNow:
+        if (decision == AutoProgressSync::Decision::RemoteAhead) {
+          // The partner device is further ahead. Never move the server
+          // backwards; offer the remote position on the book's next open and
+          // drop the pending bit, because this change can never be uploaded
+          // under the Smart rule. The next progress save re-marks the book.
+          if (hasRemote && !fromParked) parkRemote(remote);
+          ++result.parked;
+        } else {
+          ++result.inSync;
+        }
         SyncPending::clear(path, SyncPending::PROGRESS_BIT);
-        ++result.inSync;
         break;
     }
   }
   cursor.end();
 
   flush(result, batch, batchPaths, connection);
-  if (networkUp) wifiOff();
+  if (network == Network::Up) wifiOff();
+  // Books settled from the SD card run no request, but the burst did run.
+  if (result.status == AutoProgressSync::Result::Status::Skipped && handled) {
+    result.status = AutoProgressSync::Result::Status::Ran;
+  }
   return result;
 }
 
@@ -266,12 +293,14 @@ AutoProgressSync::Result AutoProgressSync::pushPending(const uint8_t batteryPerc
 
   const uint32_t start = millis();
   result = runBurst();
+  const char* status = result.status == Result::Status::Ran       ? "ran"
+                       : result.status == Result::Status::Skipped ? "skipped"
+                                                                  : "no network";
   // One line per sleep, whatever the outcome: this is the only record of what
   // an unattended burst did.
   LOG_INF(TAG, "Sleep sync %s: pushed=%u parked=%u in-sync=%u failed=%u budget=%s elapsed=%u ms heap=%u maxalloc=%u",
-          result.status == Result::Status::Ran ? "ran" : "no network", static_cast<unsigned>(result.pushed),
-          static_cast<unsigned>(result.parked), static_cast<unsigned>(result.inSync),
-          static_cast<unsigned>(result.failed), result.budgetHit ? "hit" : "ok",
+          status, static_cast<unsigned>(result.pushed), static_cast<unsigned>(result.parked),
+          static_cast<unsigned>(result.inSync), static_cast<unsigned>(result.failed), result.budgetHit ? "hit" : "ok",
           static_cast<unsigned>(millis() - start), static_cast<unsigned>(ESP.getFreeHeap()),
           static_cast<unsigned>(ESP.getMaxAllocHeap()));
   return result;

@@ -14,6 +14,11 @@
 // position), so a position behind the server is never uploaded: it is parked
 // instead and offered on the book's next open. A failed book keeps its pending
 // bit and is retried at the next sleep or manual sync.
+//
+// The radio is joined lazily, per book: the saved position and the parked
+// remote are compared locally first, so a book whose remote is already ahead
+// costs no Wi-Fi join on any sleep. Only a book that actually needs a GET or a
+// PUT brings the radio up, and it is switched off again before returning.
 namespace AutoProgressSync {
 
 // Whole-burst cap. It only delays power-off; the panel already shows the sleep
@@ -47,25 +52,19 @@ inline bool budgetExhausted(const uint32_t startMs, const uint32_t nowMs, const 
   return static_cast<uint32_t>(nowMs - startMs) >= budgetMs;
 }
 
-// What the burst does with one book. The pending bit is cleared only when the
-// book's position is known to be on the server (just uploaded, or already
-// there); otherwise the change is kept for the next sleep or manual sync.
+// What the burst does with one book. The pending bit is cleared whenever the
+// decision settles the book without a successful upload: the server already
+// holds this position, or it holds a newer one. A book behind the server would
+// never be uploaded under the Smart rule, so keeping it pending would only
+// retry that comparison at every sleep; the next progress save re-marks it.
+// A book that could not be handled at all simply keeps its bit (no action).
 enum class PendingAction : uint8_t {
   UploadAndClearOnSuccess,
-  KeepPending,  // the remote is ahead, or the book could not be handled
-  ClearNow,     // the server already has exactly this position
+  ClearNow,  // the server holds this position or a newer one
 };
 
 inline PendingAction pendingActionFor(const Decision decision) {
-  switch (decision) {
-    case Decision::Upload:
-      return PendingAction::UploadAndClearOnSuccess;
-    case Decision::RemoteAhead:
-      return PendingAction::KeepPending;
-    case Decision::InSync:
-      return PendingAction::ClearNow;
-  }
-  return PendingAction::KeepPending;
+  return decision == Decision::Upload ? PendingAction::UploadAndClearOnSuccess : PendingAction::ClearNow;
 }
 
 enum class JoinPhase : uint8_t {
@@ -83,12 +82,12 @@ inline JoinPhase joinPhase(const bool hasCachedAp, const uint32_t elapsedMs) {
 struct Result {
   enum class Status : uint8_t {
     Skipped,    // setting off, no credentials, nothing pending, or battery low
-    NoNetwork,  // the saved network did not come up
-    Ran,        // the burst reached the server
+    NoNetwork,  // a request was needed and the saved network did not come up
+    Ran,        // the burst completed, with or without a network
   };
   Status status = Status::Skipped;
   uint8_t pushed = 0;  // books uploaded and confirmed
-  uint8_t parked = 0;  // remote ahead: left for the book's next open
+  uint8_t parked = 0;  // remote ahead: parked for the next open, bit cleared
   uint8_t inSync = 0;  // already on the server; pending bit cleared
   uint8_t failed = 0;  // kept pending for the next sleep or manual sync
   bool budgetHit = false;
