@@ -37,9 +37,11 @@ bool renamePath(const std::string& from, const std::string& to);
 // In-app delete.
 bool removePath(const std::string& path);
 
-// Entries whose path `keep` accepts (all when null); 0 when the list is
-// missing or unreadable. Read-only, for sizing a progress bar.
-uint32_t count(bool (*keep)(const std::string& path, void* context) = nullptr, void* context = nullptr);
+// Entries whose path `keep` accepts (all when null) and whose mask overlaps
+// `withBits` (any bit when 0); 0 when the list is missing or unreadable.
+// Read-only, for sizing a progress bar or deciding whether a sync is needed.
+uint32_t count(bool (*keep)(const std::string& path, void* context) = nullptr, void* context = nullptr,
+               uint8_t withBits = 0);
 
 // Walks a snapshot of the list taken by begin(), so the live list can change
 // (bits cleared as uploads succeed) while the walk continues. No file handle is

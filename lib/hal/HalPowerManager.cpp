@@ -142,7 +142,23 @@ void HalPowerManager::setPowerSaving(bool enabled) {
   // Otherwise, no change needed
 }
 
-void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
+namespace {
+// Bounded form of freeink::PowerManager::waitForPowerButtonRelease(), which
+// polls forever. The headless sync boot may reach sleep while the user is
+// still holding Power; waiting without a limit would keep the device awake
+// until release, so it gives up after `timeoutMs` and sleeps anyway.
+void waitForPowerButtonReleaseBounded(const uint32_t timeoutMs) {
+  const int8_t pin = BoardConfig::ACTIVE.input.power;
+  if (pin < 0) return;
+  const bool activeHigh = BoardConfig::ACTIVE.input.powerActiveHigh;
+  pinMode(pin, activeHigh ? INPUT_PULLDOWN : INPUT_PULLUP);
+  const int pressedLevel = activeHigh ? HIGH : LOW;
+  const uint32_t start = millis();
+  while (digitalRead(pin) == pressedLevel && millis() - start < timeoutMs) delay(50);
+}
+}  // namespace
+
+void HalPowerManager::startDeepSleep(HalGPIO& gpio, const uint32_t powerButtonReleaseTimeoutMs) const {
 #if FREEINK_DEVICE_PICCO
   Frontlight.setOn(false);
   if (!gpio.prepareForDeepSleep()) LOG_ERR("PWR", "Touch sleep preparation failed");
@@ -202,7 +218,11 @@ void HalPowerManager::startDeepSleep(HalGPIO& gpio) const {
   // wake source. On the ESP32-C3 that overwrites the power pin's sleep input
   // configuration, so short presses can be missed. Isolate first, then restore
   // and arm the board-configured power pin immediately before sleeping.
-  freeink::PowerManager::waitForPowerButtonRelease();
+  if (powerButtonReleaseTimeoutMs == UINT32_MAX) {
+    freeink::PowerManager::waitForPowerButtonRelease();
+  } else {
+    waitForPowerButtonReleaseBounded(powerButtonReleaseTimeoutMs);
+  }
   esp_sleep_config_gpio_isolate();
   freeink::PowerManager::armPowerButtonWakeup();
   gpio_deep_sleep_hold_en();

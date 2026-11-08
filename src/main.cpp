@@ -355,6 +355,10 @@ RTC_NOINIT_ATTR library::ScanSleepToken libraryScanSleepToken;
 RTC_NOINIT_ATTR uint32_t silentRebootMagic;
 RTC_NOINIT_ATTR uint32_t silentRebootTarget;
 RTC_NOINIT_ATTR uint32_t silentRebootPayload;
+// Back-to-back sleep-sync boots. RTC memory survives the ESP.restart() that
+// arms one but is garbage on a cold boot, so every use is guarded by a value
+// this boot wrote. See armSleepSyncBoot() and its use in setup().
+RTC_NOINIT_ATTR uint32_t sleepSyncBootAttempts;
 RTC_NOINIT_ATTR uint32_t silentReaderPageBuildMagic;
 RTC_NOINIT_ATTR uint32_t silentReaderPageBuildBookHash;
 RTC_NOINIT_ATTR uint32_t silentReaderPageBuildPackedTarget;
@@ -373,6 +377,9 @@ constexpr uint32_t SILENT_REBOOT_READER_CLEAN_IMAGE_BASE = 1U << 0;
 constexpr uint32_t SILENT_READER_PAGE_BUILD_MAGIC = 0xC1EAB017;
 constexpr uint32_t SILENT_READER_PAGE_BUILD_AUTO_TURN = 1U << 0;
 constexpr uint32_t NETWORK_RENDER_TASK_STACK_BYTES = 8192;
+// The sync boot may reach sleep while the user is holding Power. Bounded wait
+// before sleeping anyway; the panel already shows the sleep image either way.
+constexpr uint32_t SYNC_BOOT_POWER_RELEASE_WAIT_MS = 2000;
 // FreeType's anti-aliased rasterizer reserves a 16 KiB scratch pool on its
 // caller's stack. Scalable fonts are S3-only, so leave C3's constrained reader
 // stack unchanged and give S3 reader renders room for their normal call frames.
@@ -500,6 +507,20 @@ void silentRestartToNetwork(const NetworkBootTarget target, const uint32_t paylo
 }
 
 void silentRestartToManageFonts() { silentRestartToNetwork(NetworkBootTarget::MANAGE_FONTS); }
+
+// Arms the headless progress-sync boot from enterDeepSleep(). Unlike
+// silentRestartToNetwork() this neither draws a "Loading" popup (the sleep
+// image is already on the panel and a popup would be visible and wrong) nor
+// respects deepSleepInProgress (set on purpose by the caller). Does not return.
+static void armSleepSyncBoot() {
+  ++sleepSyncBootAttempts;
+  clearSilentRestartReaderPageBuild();
+  silentRebootTarget = static_cast<uint32_t>(NetworkBootTarget::PROGRESS_UPLOAD);
+  silentRebootPayload = 0;
+  silentRebootMagic = SILENT_REBOOT_MAGIC;
+  LOG_INF("MAIN", "Restarting into the progress sync boot (attempt %u)", static_cast<unsigned>(sleepSyncBootAttempts));
+  ESP.restart();
+}
 
 static uint32_t encodeKOReaderSyncOrientation(const uint8_t orientation) {
   return orientation < CrossPointSettings::ORIENTATION_COUNT ? static_cast<uint32_t>(orientation) + 1 : 0;
@@ -1125,6 +1146,41 @@ void mirrorWakeShortPressToNvs() {
 #endif
 }
 
+// Shared sleep tail: panel shutdown, wake-button mirror and the wake sources /
+// sleep settings. The normal path and the headless sync boot must agree on all
+// of it, so it lives in one place. `powerButtonReleaseTimeoutMs` bounds the
+// wait for a held Power button (see HalPowerManager::startDeepSleep); the
+// normal path keeps the SDK's unbounded wait.
+static void finishSleepAndPowerOff(const uint32_t powerButtonReleaseTimeoutMs = UINT32_MAX) {
+#if FREEINK_DEVICE_PICCO
+  // The I2C light retains its state through sleep. Keep the saved preference.
+  Frontlight.setOn(false);
+  const bool usbWakeRequested = powerManager.holdWhileUsbPowered(gpio);
+#endif
+  putTiltSensorToSleepForDeepSleep();
+  display.deepSleep();
+  mirrorWakeShortPressToNvs();
+  LOG_DBG("MAIN", "Entering deep sleep");
+
+#if FREEINK_DEVICE_PICCO
+  if (usbWakeRequested) {
+    // A short press may already be released after display shutdown. Preserve
+    // the accepted wake through reset instead of depending on its GPIO level.
+    piccoUsbWakeToken.arm();
+    ESP.restart();
+    return;
+  }
+#endif
+#ifdef SIMULATOR
+  // The simulator's HAL stand-in keeps the original one-argument signature and
+  // has no holding button to wait for.
+  (void)powerButtonReleaseTimeoutMs;
+  powerManager.startDeepSleep(gpio);
+#else
+  powerManager.startDeepSleep(gpio, powerButtonReleaseTimeoutMs);
+#endif
+}
+
 // Enter deep sleep mode
 void enterDeepSleep(bool fromTimeout) {
 #ifndef SIMULATOR
@@ -1179,48 +1235,28 @@ void enterDeepSleep(bool fromTimeout) {
   // can be written again until the next wake.
   BatteryDiagnosticLog::record(BatteryDiagnosticLog::Event::Sleep, BoardConfig::ACTIVE.name);
 
-  // Push pending reading positions now: the sleep screen is already on the
-  // panel, the reader has released its memory, and SD is still mounted. This
-  // runs for the idle-timeout sleep too — with nothing pending it returns at
-  // once, and a change skipped here would only wait for the next sleep. Bounded
-  // and best-effort: a book that fails keeps its pending bit for the next sleep
-  // or a manual sync.
-  if (KOREADER_STORE.getAutoSyncProgress()) {
-    // Same release every network screen does before it brings up Wi-Fi and
-    // TLS: a reader SD font keeps glyph, kerning and advance tables resident,
-    // and with it Wi-Fi plus wolfSSL do not fit (measured: GET failed with
-    // LOW_MEMORY at 75 KB free / 29 KB max block). Deep sleep follows, and the
-    // next boot loads the font again, so nothing needs restoring.
-    AutoProgressSync::noteHeap("pre-release");
-    sdFontSystem.releaseForNetwork(renderer);
+  // The pending progress upload does not run here: Wi-Fi leaves ~38 KB free /
+  // ~33 KB max block even after the reader released everything, which is below
+  // what a TLS handshake needs, and the failure is fragmentation that only a
+  // chip reset clears. Arm a restart into the same minimal network boot every
+  // other Wi-Fi feature uses and let that boot run the burst and sleep. When no
+  // upload is needed this is a pure read and the sleep path is unchanged.
+  const uint8_t batteryPercent = static_cast<uint8_t>(powerManager.getBatteryPercentage());
+  if (AutoProgressSync::wantsSleepSync(batteryPercent, sleepSyncBootAttempts)) {
+    // Storage is unmounted exactly as the normal tail does; the sync boot
+    // remounts it. The library-index token must survive: it is saved here and
+    // its consume() is skipped in the sync boot, so the next wake still
+    // restores the index instead of reconciling the whole card.
+    libraryScanSleepToken.save(!library::libraryIndexNeedsRefresh());
+    Storage.shutdown();
+    armSleepSyncBoot();  // does not return
   }
-  AutoProgressSync::pushPending(static_cast<uint8_t>(powerManager.getBatteryPercentage()));
 
   // All sleep-time file writes are complete. Stop SDMMC before the power path
   // cuts peripheral rails and isolates the bus pads; SPI boards are a no-op.
   libraryScanSleepToken.save(!library::libraryIndexNeedsRefresh());
   Storage.shutdown();
-
-#if FREEINK_DEVICE_PICCO
-  // The I2C light retains its state through sleep. Keep the saved preference.
-  Frontlight.setOn(false);
-  const bool usbWakeRequested = powerManager.holdWhileUsbPowered(gpio);
-#endif
-  putTiltSensorToSleepForDeepSleep();
-  display.deepSleep();
-  mirrorWakeShortPressToNvs();
-  LOG_DBG("MAIN", "Entering deep sleep");
-
-#if FREEINK_DEVICE_PICCO
-  if (usbWakeRequested) {
-    // A short press may already be released after display shutdown. Preserve
-    // the accepted wake through reset instead of depending on its GPIO level.
-    piccoUsbWakeToken.arm();
-    ESP.restart();
-    return;
-  }
-#endif
-  powerManager.startDeepSleep(gpio);
+  finishSleepAndPowerOff();
 }
 
 void setupDisplayAndFonts(const bool seamless, const bool loadReaderResources, const bool useReaderRenderStack) {
@@ -1269,6 +1305,39 @@ void setupDisplayAndFonts(const bool seamless, const bool loadReaderResources, c
   filenameFontSystem.ensureLoaded(renderer);
 }
 
+// The headless progress-sync boot, entered from setup() right after storage is
+// up and before anything visible or expensive. The pre-restart enterDeepSleep()
+// already painted the sleep screen and did every normal sleep-time write, so
+// this boot loads only what the burst needs, uploads, and goes back to sleep.
+// It never paints: the retained sleep image must stay exactly as it is.
+static void runSleepSyncBoot() {
+  // Capabilities first: SETTINGS.loadFromFile() validates saved gestures against
+  // the frontlight and would resave them as unavailable if it ran blind.
+  Frontlight.initializeHardware();
+  SETTINGS.loadFromFile();
+  // Loaded explicitly: the normal boot only opens it for the KOReader targets.
+  KOREADER_STORE.loadFromFile();
+  // errorString() and the upload payload use translated strings.
+  I18N.begin(SETTINGS.languageCode, SETTINGS.languageCacheGeneration);
+  Storage.installDateTimeCallback(&SETTINGS.clockUtcOffsetQ);
+
+  AutoProgressSync::noteHeap("syncboot");
+  AutoProgressSync::pushPending(static_cast<uint8_t>(powerManager.getBatteryPercentage()), /*syncBoot=*/true);
+
+  // Bring the panel driver up only to put the controller back into deep sleep:
+  // the reset released it, and deepSleep() is a no-op without a driver. begin()
+  // writes controller registers but never paints, and deepSleep() powers the
+  // booster down without touching the retained image.
+  display.begin(/*seamless=*/true);
+  AutoProgressSync::noteSyncBootTotal(millis());
+  Storage.shutdown();
+  // Bounded wait: a Power button still held must not keep the device awake.
+  finishSleepAndPowerOff(SYNC_BOOT_POWER_RELEASE_WAIT_MS);
+  // Only on the Picco USB-wake path does the tail return; that path already
+  // restarted intentionally.
+  ESP.restart();
+}
+
 void setup() {
 #ifdef SIMULATOR
   SimulatorLifecycle::restoreSilentRebootToken(silentRebootMagic, silentRebootTarget, silentRebootPayload);
@@ -1277,12 +1346,22 @@ void setup() {
 
   const esp_reset_reason_t rawResetReason = esp_reset_reason();
   const esp_sleep_wakeup_cause_t rawWakeupCause = esp_sleep_get_wakeup_cause();
+
 #if FREEINK_DEVICE_PICCO
   const bool usbSleepWake = piccoUsbWakeToken.consume(rawResetReason == ESP_RST_SW);
 #else
   constexpr bool usbSleepWake = false;
 #endif
-  if (libraryScanSleepToken.consume(rawResetReason == ESP_RST_DEEPSLEEP)) library::restoreLibraryIndexAfterSleep();
+  // The headless sync boot must not consume the library-index token: the
+  // pre-restart enterDeepSleep() saved it for the next real wake, and eating it
+  // here would force a whole-card reconciliation on that wake. Read the target
+  // before the read-and-clear below.
+  const uint32_t pendingNetworkTarget =
+      silentRebootTarget & ~(SILENT_REBOOT_FRONTLIGHT_VALID | SILENT_REBOOT_FRONTLIGHT_ON);
+  const bool sleepSyncBootPending = silentRebootMagic == SILENT_REBOOT_MAGIC &&
+                                    pendingNetworkTarget == static_cast<uint32_t>(NetworkBootTarget::PROGRESS_UPLOAD);
+  if (!sleepSyncBootPending && libraryScanSleepToken.consume(rawResetReason == ESP_RST_DEEPSLEEP))
+    library::restoreLibraryIndexAfterSleep();
 
 #ifdef ENABLE_SERIAL_LOG
 #ifdef CROSSPOINT_WAIT_FOR_USB_SERIAL
@@ -1340,6 +1419,12 @@ void setup() {
   if (!isSilentReboot || snapshotTarget != SILENT_REBOOT_TARGET_READER) {
     clearSilentRestartReaderPageBuild();
   }
+  const bool isSleepSyncBoot =
+      isSilentReboot && snapshotTarget == static_cast<uint32_t>(NetworkBootTarget::PROGRESS_UPLOAD);
+  // A real boot breaks any run of sync boots, so the guard counter only grows
+  // while sync boots keep repeating (a crash before the read-and-clear above
+  // would otherwise loop forever).
+  if (!isSleepSyncBoot) sleepSyncBootAttempts = 0;
 
   gpio.begin();
 #if FREEINK_DEVICE_PICCO
@@ -1445,6 +1530,20 @@ void setup() {
   display.startBegin();
 
   HalSystem::checkPanic();
+
+  // Headless progress-sync boot: before the panel driver, plugins, themes and
+  // fonts are brought up, because none of them are needed and all of them cost
+  // heap. A panic in it has already cleared the flag, so this boots normally
+  // instead of looping; the attempt counter stops even an early crash loop.
+  if (isSleepSyncBoot && !rebootedFromPanic) {
+    if (sleepSyncBootAttempts < AutoProgressSync::MAX_SYNC_BOOT_ATTEMPTS) {
+      ++sleepSyncBootAttempts;
+      runSleepSyncBoot();
+    } else {
+      LOG_ERR("MAIN", "Progress sync boot repeated %u times; taking the normal boot",
+              static_cast<unsigned>(sleepSyncBootAttempts));
+    }
+  }
 
   if (!PluginBundle::recoverPending()) LOG_ERR("PLUG", "Plugin install recovery pending");
   // I2C light capabilities must be known before settings validate saved gestures.
@@ -1681,6 +1780,11 @@ void setup() {
         }
         break;
       }
+      case NetworkBootTarget::PROGRESS_UPLOAD:
+        // Only reached when the headless branch above was skipped (panic, or
+        // the loop guard): there is no activity to show, so go Home.
+        LOG_ERR("MAIN", "Progress sync boot reached the activity router; returning home");
+        break;
     }
     if (!launched) {
       LOG_ERR("MAIN", "Minimal network boot target failed; returning home");

@@ -64,8 +64,11 @@ class HalPowerManager {
   void setPowerSaving(bool enabled);
 
   // Setup wake up GPIO and enter deep sleep
-  // Should be called inside main loop() to handle the lockCount
-  void startDeepSleep(HalGPIO& gpio) const;
+  // Should be called inside main loop() to handle the lockCount.
+  // powerButtonReleaseTimeoutMs bounds the wait for a held Power button; the
+  // SDK helper itself waits forever, which is right at the end of a
+  // user-initiated sleep but not in the headless sync boot.
+  void startDeepSleep(HalGPIO& gpio, uint32_t powerButtonReleaseTimeoutMs = UINT32_MAX) const;
 #if FREEINK_DEVICE_PICCO
   // Called once at startup. USB light-sleep wakes use an intentional restart.
   void restoreBatteryAfterSleep(bool usbSleepWake);

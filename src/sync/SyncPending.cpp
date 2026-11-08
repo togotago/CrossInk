@@ -178,7 +178,7 @@ bool removePath(const std::string& path) {
 
 Cursor::~Cursor() { end(); }
 
-uint32_t count(bool (*keep)(const std::string& path, void* context), void* context) {
+uint32_t count(bool (*keep)(const std::string& path, void* context), void* context, const uint8_t withBits) {
   SyncFiles::Reader reader(PATH);
   uint8_t version = 0;
   if (reader.open() == SyncFiles::Reader::Source::None || !reader.pod(version) || version != VERSION) return 0;
@@ -188,6 +188,7 @@ uint32_t count(bool (*keep)(const std::string& path, void* context), void* conte
   while (!reader.atEnd()) {
     uint8_t mask = 0;
     if (!reader.pod(mask) || !reader.string16(entryPath, MAX_PATH_LENGTH)) break;
+    if (withBits != 0 && (mask & withBits) == 0) continue;
     if (!keep || keep(entryPath, context)) ++total;
   }
   return total;

@@ -369,9 +369,28 @@ void AutoProgressSync::noteHeap(const char* stage) {
               static_cast<unsigned>(ESP.getMaxAllocHeap()));
 }
 
-AutoProgressSync::Result AutoProgressSync::pushPending(const uint8_t batteryPercent) {
+void AutoProgressSync::noteSyncBootTotal(const uint32_t totalMs) {
+  traceAppend("boot=sync done at %u ms", static_cast<unsigned>(totalMs));
+  traceFlush();
+}
+
+bool AutoProgressSync::wantsSleepSync(const uint8_t batteryPercent, const uint32_t attempts) {
+  // Only progress entries bring the radio up here; a stats-only entry belongs
+  // to the stats uploaders and must not cost a boot.
+  const uint32_t progressPending = SyncPending::count(nullptr, nullptr, SyncPending::PROGRESS_BIT);
+  return shouldArmSyncBoot(KOREADER_STORE.getAutoSyncProgress(), KOREADER_STORE.hasCredentials(), batteryPercent,
+                           progressPending, attempts);
+}
+
+AutoProgressSync::Result AutoProgressSync::pushPending(const uint8_t batteryPercent, const bool syncBoot) {
   Result result;
-  if (!KOREADER_STORE.getAutoSyncProgress()) return result;
+  // The first burst after the restart is otherwise indistinguishable in the
+  // trace from the old in-place one.
+  if (syncBoot) traceAppend("boot=sync");
+  if (!KOREADER_STORE.getAutoSyncProgress()) {
+    if (syncBoot) traceFlush();
+    return result;
+  }
   noteHeap("start");
   traceAppend("battery=%u%%", static_cast<unsigned>(batteryPercent));
   if (!KOREADER_STORE.hasCredentials()) {

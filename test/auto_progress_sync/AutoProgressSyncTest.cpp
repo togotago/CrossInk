@@ -67,3 +67,22 @@ TEST(AutoProgressSyncJoin, AlwaysFallsBackWithoutACachedAccessPoint) {
   EXPECT_EQ(joinPhase(false, 0), JoinPhase::FullScan);
   EXPECT_EQ(joinPhase(false, FAST_JOIN_BUDGET_MS - 1), JoinPhase::FullScan);
 }
+
+// Sync-boot gate: the burst runs in its own boot, so a device that would skip
+// the upload must never pay that boot. Each condition alone is enough to stop.
+TEST(AutoProgressSyncBoot, ArmsOnlyWhenTheBurstWouldRun) {
+  EXPECT_TRUE(shouldArmSyncBoot(true, true, MIN_BATTERY_PERCENT, 1, 0));
+  EXPECT_TRUE(shouldArmSyncBoot(true, true, 100, 3, MAX_SYNC_BOOT_ATTEMPTS - 1));
+}
+
+TEST(AutoProgressSyncBoot, RequiresTheSettingCredentialsBatteryAndWork) {
+  EXPECT_FALSE(shouldArmSyncBoot(false, true, 100, 1, 0));  // auto-sync off
+  EXPECT_FALSE(shouldArmSyncBoot(true, false, 100, 1, 0));  // no account
+  EXPECT_FALSE(shouldArmSyncBoot(true, true, MIN_BATTERY_PERCENT - 1, 1, 0));
+  EXPECT_FALSE(shouldArmSyncBoot(true, true, 100, 0, 0));  // nothing pending
+}
+
+TEST(AutoProgressSyncBoot, StopsAfterTooManyConsecutiveBoots) {
+  EXPECT_FALSE(shouldArmSyncBoot(true, true, 100, 1, MAX_SYNC_BOOT_ATTEMPTS));
+  EXPECT_FALSE(shouldArmSyncBoot(true, true, 100, 1, MAX_SYNC_BOOT_ATTEMPTS + 1));
+}

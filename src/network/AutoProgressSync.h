@@ -30,8 +30,23 @@ constexpr uint32_t CONNECT_BUDGET_MS = 5000;
 constexpr uint32_t FAST_JOIN_BUDGET_MS = 2000;
 // Below this the burst is skipped; the same floor the plugin sleep hook uses.
 constexpr uint8_t MIN_BATTERY_PERCENT = 20;
+// A sync boot that never reaches deep sleep must not loop. The counter is RTC
+// memory: after this many back-to-back sync boots the device stops arming them
+// and takes the ordinary sleep path instead.
+constexpr uint32_t MAX_SYNC_BOOT_ATTEMPTS = 2;
 // 0.1 percentage points, the same epsilon Smart sync uses.
 constexpr float SAME_PROGRESS_EPSILON = 0.001f;
+
+// Whether sleep should hand the pending upload to the headless sync boot.
+// The burst cannot fit in the reader's process (Wi-Fi leaves ~38 KB free and
+// ~33 KB max block even after the reader releases everything), so it runs in
+// the same minimal boot every other network feature uses. Pure so the gate is
+// tested on its own; pushPending() re-checks the same conditions when it runs.
+inline bool shouldArmSyncBoot(const bool autoSyncOn, const bool hasCredentials, const uint8_t batteryPercent,
+                              const uint32_t progressPending, const uint32_t attempts) {
+  return autoSyncOn && hasCredentials && batteryPercent >= MIN_BATTERY_PERCENT && progressPending > 0 &&
+         attempts < MAX_SYNC_BOOT_ATTEMPTS;
+}
 
 enum class Decision : uint8_t {
   Upload,       // local is ahead, or the server has no position for the book
@@ -96,8 +111,19 @@ struct Result {
 // Adds free heap and the largest free block to the SD trace of the next burst.
 void noteHeap(const char* stage);
 
+// One extra SD trace line for the headless sync boot: total milliseconds from
+// the restart to the start of deep sleep, so the cost of that boot is visible
+// and comparable across devices.
+void noteSyncBootTotal(uint32_t totalMs);
+
+// Whether sleep should restart into the headless sync boot. Reads the same
+// stores pushPending() gates on, so a device with the setting off, no
+// credentials, a low battery or nothing pending never pays a boot.
+bool wantsSleepSync(uint8_t batteryPercent, uint32_t attempts);
+
 // batteryPercent is the same reading the plugin sleep hook uses (main.cpp).
+// syncBoot marks the SD trace line so a burst's origin is unambiguous.
 // Leaves Wi-Fi off.
-Result pushPending(uint8_t batteryPercent);
+Result pushPending(uint8_t batteryPercent, bool syncBoot = false);
 
 }  // namespace AutoProgressSync
