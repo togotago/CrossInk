@@ -151,6 +151,7 @@
 
 ### Changed
 
+- Sync Book returns to the reader much sooner: it joins the saved Wi-Fi network directly instead of opening the network list, shows no intermediate progress screens, uses one secure connection for the fetch and upload, and skips the time check when the clock is already set. When no saved network is in range it gives up in about a second, and the network list still opens so a phone hotspot can be picked.
 - SD fonts containing both BMP and supplementary Unicode ranges use less resident lookup-table memory, and TTF fonts validate faster while preserving font integrity checks.
 - English is the only built-in interface language. Other languages are included in a separate release download and installed through Language settings.
 - Display → Hide Battery % is replaced by the Battery option in each status bar's settings; existing choices carry over.
