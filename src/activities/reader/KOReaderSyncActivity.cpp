@@ -311,10 +311,8 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
   }
   requestUpdate(true);
 
-  // The network boot already adopted the RTC into trustedtime, and the progress
-  // PUT carries no timestamp, so a trusted clock needs no blocking NTP. Stats
-  // and clippings read timestamps already recorded in their files; only an
-  // unknown clock (fresh RTC) is worth the exchange.
+  // The boot already adopted the RTC, and the PUT carries no timestamp, so only
+  // an unknown clock is worth the blocking exchange.
   if (trustedtime::trustedNow() == 0) syncTimeWithNTP();
   AutoProgressSync::traceManualMark("ntp", millis());
 
@@ -677,8 +675,7 @@ void KOReaderSyncActivity::performUpload() {
     returnToSource();
     return;
   }
-  // A single-book smart sync has nothing to ask: skip the completion screen and
-  // its auto-return wait and go back to the reader at once.
+  // A single-book smart sync has nothing to ask: no completion screen or wait.
   if (quietPaints && smartSyncEnabled()) {
     returnToSource();
     return;
@@ -876,9 +873,8 @@ void KOReaderSyncActivity::onEnter() {
     return;
   }
 
-  // Quick connect first: the remembered network joins in one attempt, with no
-  // scan list and no Wi-Fi screen. A failure (nothing in range, refused) falls
-  // back to the list below, which is how a phone hotspot is picked when away.
+  // Quick connect: the saved network joins without the scan list or its screen.
+  // A failure falls back to the list, which is how a hotspot is picked away.
   if (AutoProgressSync::joinKnownNetwork(AutoProgressSync::CONNECT_BUDGET_MS)) {
     LOG_INF("KOSync", "Joined the saved network without the Wi-Fi list");
     onWifiSelectionComplete(true);
@@ -927,9 +923,8 @@ void KOReaderSyncActivity::render(RenderLock&&) {
   // The bulk sync's progress screen stays up; touching the framebuffer here
   // would only cost a refresh.
   if (background) return;
-  // Single-book sync: the intermediate status screens are presentation only,
-  // and every state change is a full HALF refresh on this panel. Errors and
-  // anything that needs an answer still paint below.
+  // Single-book sync: status screens are presentation only, and each state
+  // change is a full HALF refresh. Errors and prompts still paint below.
   if (quietPaints && (state == SYNCING || state == UPLOADING)) return;
   renderer.clearScreen();
 
