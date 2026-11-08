@@ -1,6 +1,9 @@
 #include "AutoProgressSync.h"
 
 #include <Arduino.h>
+#include <cstdarg>
+#include <cstdio>
+#include <algorithm>
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Logging.h>
@@ -21,6 +24,57 @@
 namespace {
 
 constexpr char TAG[] = "AutoSync";
+
+// The X4 may have no usable serial port (USB-locked units), so each burst
+// also leaves one line on the SD card: the same messages, joined, plus the
+// summary. Capped so a forgotten toggle cannot fill a card.
+constexpr char TRACE_PATH[] = "/.crosspoint/autosync.log";
+constexpr char TRACE_OLD_PATH[] = "/.crosspoint/autosync.old.log";
+constexpr size_t TRACE_MAX_BYTES = 32u * 1024u;
+char trace[640];
+size_t traceLen = 0;
+
+void traceAppend(const char* format, ...) {
+  if (traceLen >= sizeof(trace) - 1) return;
+  if (traceLen > 0) trace[traceLen++] = '|';
+  va_list args;
+  va_start(args, format);
+  const int written = vsnprintf(trace + traceLen, sizeof(trace) - traceLen, format, args);
+  va_end(args);
+  if (written > 0) traceLen = std::min(sizeof(trace) - 1, traceLen + static_cast<size_t>(written));
+  trace[traceLen] = '\0';
+}
+
+void traceFlush() {
+  if (traceLen == 0) return;
+  HalFile probe = Storage.open(TRACE_PATH, O_RDONLY);
+  const size_t existing = probe ? probe.size() : 0;
+  if (probe) probe.close();
+  if (existing > TRACE_MAX_BYTES) {
+    Storage.remove(TRACE_OLD_PATH);
+    Storage.rename(TRACE_PATH, TRACE_OLD_PATH);
+  }
+  HalFile file = Storage.open(TRACE_PATH, O_WRONLY | O_CREAT | O_APPEND);
+  if (file) {
+    char stamp[32];
+    const int64_t now = trustedtime::trustedNow();
+    const int stampLen = now > 0 ? snprintf(stamp, sizeof(stamp), "%lld ", static_cast<long long>(now))
+                                 : snprintf(stamp, sizeof(stamp), "untrusted-clock ");
+    file.write(stamp, static_cast<size_t>(stampLen));
+    file.write(trace, traceLen);
+    file.write("\n", 1);
+    file.close();  // close() syncs; the SD rail is cut right after this burst
+  }
+  traceLen = 0;
+  trace[0] = '\0';
+}
+
+// Serial log and SD trace in one call.
+#define ALOG(level, format, ...)                     \
+  do {                                               \
+    level(TAG, format, ##__VA_ARGS__);               \
+    traceAppend(format, ##__VA_ARGS__);              \
+  } while (0)
 // Bounded clock work: an untrusted clock only skews event timestamps, and the
 // upload carries no timestamp of its own, so this is never worth the 5 s the
 // manual sync path allows.
@@ -30,7 +84,7 @@ bool connectLastKnownNetwork(const uint32_t budgetMs) {
   if (hasActiveStationWifiConnection()) return true;
   const auto credential = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
   if (!credential) {
-    LOG_INF(TAG, "No saved network for the last SSID");
+    ALOG(LOG_INF, "No saved network for the last SSID");
     return false;
   }
   WiFi.mode(WIFI_STA);
@@ -47,10 +101,10 @@ bool connectLastKnownNetwork(const uint32_t budgetMs) {
     WiFi.begin(credential->ssid.c_str(), credential->password.c_str(), channel, bssid);
     while (WiFi.status() != WL_CONNECTED && millis() - start < AutoProgressSync::FAST_JOIN_BUDGET_MS) delay(50);
     if (WiFi.status() == WL_CONNECTED) {
-      LOG_INF(TAG, "WiFi joined the cached AP in %u ms", static_cast<unsigned>(millis() - start));
+      ALOG(LOG_INF, "WiFi joined the cached AP in %u ms", static_cast<unsigned>(millis() - start));
       return true;
     }
-    LOG_INF(TAG, "Cached AP did not answer; falling back to a normal join");
+    ALOG(LOG_INF, "Cached AP did not answer; falling back to a normal join");
     WiFi.disconnect(false, false, 1000);
   }
 #endif
@@ -58,12 +112,12 @@ bool connectLastKnownNetwork(const uint32_t budgetMs) {
   WiFi.begin(credential->ssid.c_str(), credential->password.c_str());
   while (WiFi.status() != WL_CONNECTED) {
     if (millis() - start >= budgetMs) {
-      LOG_INF(TAG, "WiFi join timed out after %u ms", static_cast<unsigned>(budgetMs));
+      ALOG(LOG_INF, "WiFi join timed out after %u ms", static_cast<unsigned>(budgetMs));
       return false;
     }
     delay(50);
   }
-  LOG_INF(TAG, "WiFi joined in %u ms", static_cast<unsigned>(millis() - start));
+  ALOG(LOG_INF, "WiFi joined in %u ms", static_cast<unsigned>(millis() - start));
 #ifndef SIMULATOR
   // Learn the access point for the next burst, whatever path joined it.
   uint8_t joinedBssid[6] = {};
@@ -92,7 +146,7 @@ void parkRemote(const KOReaderProgress& remote) {
   change.position = remote.position;
   change.device = remote.device;
   change.timestamp = remote.timestamp;
-  if (!SyncParked::park(change)) LOG_ERR(TAG, "Could not park the remote position");
+  if (!SyncParked::park(change)) ALOG(LOG_ERR, "Could not park the remote position");
 }
 
 // Sends the collected positions: several books go in one batch request (one TLS
@@ -112,10 +166,10 @@ void flush(AutoProgressSync::Result& result, std::vector<KOReaderProgress>& batc
       // Stock KOSync and older CrossPoint Sync servers: fall back per book.
       // The positions were released with the batch, so they are mapped again;
       // this only happens on a server without the route.
-      LOG_INF(TAG, "No batch progress route; sending one book at a time");
+      ALOG(LOG_INF, "No batch progress route; sending one book at a time");
       oneByOne = true;
     } else if (error != KOReaderSyncClient::OK) {
-      LOG_INF(TAG, "Batch PUT failed (%s); keeping them pending", KOReaderSyncClient::errorString(error).c_str());
+      ALOG(LOG_INF, "Batch PUT failed (%s); keeping them pending", KOReaderSyncClient::errorString(error).c_str());
       result.failed += static_cast<uint8_t>(paths.size());
       paths.clear();
       return;
@@ -127,13 +181,13 @@ void flush(AutoProgressSync::Result& result, std::vector<KOReaderProgress>& batc
       if (i < batch.size()) {
         progress = std::move(batch[i]);
       } else if (!ReadingSyncUpload::prepareProgress(paths[i], progress)) {
-        LOG_INF(TAG, "No usable saved position on retry; keeping it pending: %s", paths[i].c_str());
+        ALOG(LOG_INF, "No usable saved position on retry; keeping it pending: %s", paths[i].c_str());
         ++result.failed;
         continue;
       }
       const auto error = KOReaderSyncClient::updateProgress(progress, &connection);
       if (error != KOReaderSyncClient::OK) {
-        LOG_INF(TAG, "PUT failed (%s); keeping it pending", KOReaderSyncClient::errorString(error).c_str());
+        ALOG(LOG_INF, "PUT failed (%s); keeping it pending", KOReaderSyncClient::errorString(error).c_str());
         ++result.failed;
         continue;
       }
@@ -160,7 +214,7 @@ AutoProgressSync::Result runBurst() {
   const uint32_t start = millis();
   SyncPending::Cursor cursor;
   if (!cursor.begin()) {
-    LOG_ERR(TAG, "Pending list unreadable; skipping");
+    ALOG(LOG_ERR, "Pending list unreadable; skipping");
     return result;
   }
 
@@ -202,7 +256,7 @@ AutoProgressSync::Result runBurst() {
     }
     if (!Storage.exists(path.c_str())) {
       // Moved or deleted outside the reader: nothing to map. Keep the bit.
-      LOG_INF(TAG, "Pending book missing; keeping it pending: %s", path.c_str());
+      ALOG(LOG_INF, "Pending book missing; keeping it pending: %s", path.c_str());
       ++result.failed;
       continue;
     }
@@ -211,7 +265,7 @@ AutoProgressSync::Result runBurst() {
     if (!ReadingSyncUpload::prepareProgress(path, local)) {
       // No usable saved position (unread, or failed to map): keep the bit, as
       // the manual sync does.
-      LOG_INF(TAG, "No usable saved position; keeping it pending: %s", path.c_str());
+      ALOG(LOG_INF, "No usable saved position; keeping it pending: %s", path.c_str());
       ++result.failed;
       continue;
     }
@@ -226,7 +280,7 @@ AutoProgressSync::Result runBurst() {
       remote = parked.toProgress(local.document);
       hasRemote = true;
       fromParked = true;
-      LOG_INF(TAG, "Comparing with a parked remote position: %s", path.c_str());
+      ALOG(LOG_INF, "Comparing with a parked remote position: %s", path.c_str());
     } else {
       if (AutoProgressSync::budgetExhausted(start, millis())) {
         result.budgetHit = true;
@@ -240,7 +294,7 @@ AutoProgressSync::Result runBurst() {
       if (error == KOReaderSyncClient::OK) {
         hasRemote = true;
       } else if (error != KOReaderSyncClient::NOT_FOUND) {
-        LOG_INF(TAG, "GET failed (%s); keeping it pending", KOReaderSyncClient::errorString(error).c_str());
+        ALOG(LOG_INF, "GET failed (%s); keeping it pending", KOReaderSyncClient::errorString(error).c_str());
         ++result.failed;
         // A dead transport or exhausted heap fails every remaining book too.
         if (error == KOReaderSyncClient::NETWORK_ERROR || error == KOReaderSyncClient::LOW_MEMORY) break;
@@ -293,19 +347,26 @@ AutoProgressSync::Result runBurst() {
 AutoProgressSync::Result AutoProgressSync::pushPending(const uint8_t batteryPercent) {
   Result result;
   if (!KOREADER_STORE.getAutoSyncProgress()) return result;
+  traceLen = 0;
+  traceAppend("battery=%u%%", static_cast<unsigned>(batteryPercent));
   if (!KOREADER_STORE.hasCredentials()) {
-    LOG_DBG(TAG, "No sync credentials; skipping");
+    ALOG(LOG_DBG, "No sync credentials; skipping");
+    traceFlush();
     return result;
   }
   if (batteryPercent < MIN_BATTERY_PERCENT) {
-    LOG_INF(TAG, "Battery %u%% is below the sync floor; keeping positions pending",
-            static_cast<unsigned>(batteryPercent));
+    ALOG(LOG_INF, "Battery %u%% is below the sync floor; keeping positions pending",
+         static_cast<unsigned>(batteryPercent));
+    traceFlush();
     return result;
   }
-  if (SyncPending::count() == 0) {
-    LOG_DBG(TAG, "Nothing pending; skipping");
+  const uint32_t pending = SyncPending::count();
+  if (pending == 0) {
+    ALOG(LOG_DBG, "Nothing pending; skipping");
+    traceFlush();
     return result;
   }
+  traceAppend("pending=%u", static_cast<unsigned>(pending));
 
   const uint32_t start = millis();
   result = runBurst();
@@ -314,10 +375,11 @@ AutoProgressSync::Result AutoProgressSync::pushPending(const uint8_t batteryPerc
                                                                   : "no network";
   // One line per sleep, whatever the outcome: this is the only record of what
   // an unattended burst did.
-  LOG_INF(TAG, "Sleep sync %s: pushed=%u parked=%u in-sync=%u failed=%u budget=%s elapsed=%u ms heap=%u maxalloc=%u",
-          status, static_cast<unsigned>(result.pushed), static_cast<unsigned>(result.parked),
-          static_cast<unsigned>(result.inSync), static_cast<unsigned>(result.failed), result.budgetHit ? "hit" : "ok",
-          static_cast<unsigned>(millis() - start), static_cast<unsigned>(ESP.getFreeHeap()),
-          static_cast<unsigned>(ESP.getMaxAllocHeap()));
+  ALOG(LOG_INF, "Sleep sync %s: pushed=%u parked=%u in-sync=%u failed=%u budget=%s elapsed=%u ms heap=%u maxalloc=%u",
+       status, static_cast<unsigned>(result.pushed), static_cast<unsigned>(result.parked),
+       static_cast<unsigned>(result.inSync), static_cast<unsigned>(result.failed), result.budgetHit ? "hit" : "ok",
+       static_cast<unsigned>(millis() - start), static_cast<unsigned>(ESP.getFreeHeap()),
+       static_cast<unsigned>(ESP.getMaxAllocHeap()));
+  traceFlush();
   return result;
 }
