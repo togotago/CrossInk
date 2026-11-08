@@ -414,8 +414,9 @@ void AutoProgressSync::traceManualMark(const char* phase, const uint32_t atMs) {
   traceAppend("%s=+%u", phase, static_cast<unsigned>(atMs));
 }
 
-void AutoProgressSync::traceManualFlush() {
+void AutoProgressSync::traceManualFlush(const uint32_t atMs) {
   if (!manualTraceActive) return;
+  traceAppend("exit=+%u", static_cast<unsigned>(atMs));
   manualTraceActive = false;
   traceFlush();
 }

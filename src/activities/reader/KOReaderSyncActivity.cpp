@@ -909,8 +909,7 @@ void KOReaderSyncActivity::onExit() {
     endSyncConnection();
     wifiOff();
     AutoProgressSync::traceManualMark("wifi_off", millis());
-    AutoProgressSync::traceManualMark("exit", millis());
-    AutoProgressSync::traceManualFlush();
+    AutoProgressSync::traceManualFlush(millis());
     if (APP_STATE.pendingOverlayResume.returnsToBookList()) {
       silentRestart();
     } else {

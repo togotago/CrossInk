@@ -141,7 +141,8 @@ void noteSyncBootTotal(uint32_t totalMs);
 // dropped until start, so bulk and folder syncs never reach this file.
 void traceManualStart(uint32_t atMs);
 void traceManualMark(const char* phase, uint32_t atMs);
-void traceManualFlush();
+// Appends the final "exit" mark and writes the line.
+void traceManualFlush(uint32_t atMs);
 
 // Whether sleep should restart into the headless sync boot. Reads the same
 // stores pushPending() gates on, so a device with the setting off, no
