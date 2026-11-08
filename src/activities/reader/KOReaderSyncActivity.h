@@ -55,6 +55,7 @@ class KOReaderSyncActivity final : public Activity {
         localProgressDeferred(true),
         folderSync(folderSync),
         includeGlobalStats(includeGlobalStats),
+        quietPaints(!folderSync),
         readerOrientation(readerOrientation) {}
 
   // Bulk sync behind its own progress screen: draw nothing and never wait for
@@ -127,7 +128,10 @@ class KOReaderSyncActivity final : public Activity {
   bool progressSucceeded = false;
   bool progressFailed = false;
   bool background = false;  // the progress step failed (as opposed to stats or clippings)
-  std::string bookTitle;    // from the EPUB once loaded; failure screens fall back to the file name
+  // Single-book sync: skip the intermediate status paints and the completion
+  // screen, so the panel keeps the reader page until something needs an answer.
+  bool quietPaints = false;
+  std::string bookTitle;  // from the EPUB once loaded; failure screens fall back to the file name
   bool extrasAttempted = false;
   bool exitingBatch = false;
   ReadingSyncUpload::ExtrasResult extrasResult;

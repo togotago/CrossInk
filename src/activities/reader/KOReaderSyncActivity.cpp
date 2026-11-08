@@ -276,6 +276,11 @@ void KOReaderSyncActivity::completeAlreadySynced() {
     returnToSource();
     return;
   }
+  // Already in sync: nothing to ask, so a single-book sync returns at once.
+  if (quietPaints) {
+    returnToSource();
+    return;
+  }
   {
     RenderLock lock(*this);
     state = SYNC_COMPLETE;
@@ -667,6 +672,12 @@ void KOReaderSyncActivity::performUpload() {
     returnToSource();
     return;
   }
+  // A single-book smart sync has nothing to ask: skip the completion screen and
+  // its auto-return wait and go back to the reader at once.
+  if (quietPaints && smartSyncEnabled()) {
+    returnToSource();
+    return;
+  }
   {
     RenderLock lock(*this);
     state = UPLOAD_COMPLETE;
@@ -906,6 +917,10 @@ void KOReaderSyncActivity::render(RenderLock&&) {
   // The bulk sync's progress screen stays up; touching the framebuffer here
   // would only cost a refresh.
   if (background) return;
+  // Single-book sync: the intermediate status screens are presentation only,
+  // and every state change is a full HALF refresh on this panel. Errors and
+  // anything that needs an answer still paint below.
+  if (quietPaints && (state == SYNCING || state == UPLOADING)) return;
   renderer.clearScreen();
 
   auto metrics = UITheme::getInstance().getMetrics();
