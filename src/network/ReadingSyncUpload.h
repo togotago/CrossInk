@@ -12,8 +12,24 @@ struct BookReadingStats;
 
 // Foreground helpers shared by reader sync and the explicit folder upload.
 namespace ReadingSyncUpload {
+// Whether a saved progress record can be mapped. `tolerateLegacy` mirrors the
+// manual Sync Book path (KOReaderSyncActivity::ensureLocalProgressLoaded): a
+// record written by older firmware is the 6/10-byte form with no page count,
+// and an EPUB replaced under the same path can leave a stale spine index.
+// Without it the old, stricter rule applies. Pure so the rule is tested alone.
+inline bool usableSavedProgress(const bool hasPageCount, const int pageCount, const int pageNumber,
+                                const int spineIndex, const int spineCount, const bool tolerateLegacy) {
+  if (spineCount <= 0 || pageCount < 1) return false;
+  if (!hasPageCount && !tolerateLegacy) return false;
+  if (hasPageCount && pageNumber >= pageCount) return false;
+  if (!tolerateLegacy && (spineIndex < 0 || spineIndex >= spineCount)) return false;
+  return true;
+}
+
 // Only saved, mappable EPUB positions qualify. Never invent progress for an unread book.
-bool prepareProgress(const std::string& path, KOReaderProgress& progress);
+// `tolerateLegacy` is used by the sleep sync so a book the manual sync accepts is
+// not permanently refused by the automatic one.
+bool prepareProgress(const std::string& path, KOReaderProgress& progress, bool tolerateLegacy = false);
 struct ExtrasResult {
   StatsUploadClient::Result stats = StatsUploadClient::Result::Skipped;
   StatsUploadClient::Result clippings = StatsUploadClient::Result::Skipped;

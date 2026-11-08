@@ -185,7 +185,7 @@ void flush(AutoProgressSync::Result& result, std::vector<KOReaderProgress>& batc
       KOReaderProgress progress;
       if (i < batch.size()) {
         progress = std::move(batch[i]);
-      } else if (!ReadingSyncUpload::prepareProgress(paths[i], progress)) {
+      } else if (!ReadingSyncUpload::prepareProgress(paths[i], progress, /*tolerateLegacy=*/true)) {
         ALOG(LOG_INF, "No usable saved position on retry; keeping it pending: %s", paths[i].c_str());
         ++result.failed;
         continue;
@@ -272,7 +272,9 @@ AutoProgressSync::Result runBurst() {
         continue;
       }
       Item item;
-      if (!ReadingSyncUpload::prepareProgress(path, item.local)) {
+      // Tolerate a legacy record the same way the manual Sync Book does: a
+      // book that syncs by hand must not be permanently refused by sleep sync.
+      if (!ReadingSyncUpload::prepareProgress(path, item.local, /*tolerateLegacy=*/true)) {
         // No usable saved position (unread, or failed to map): keep the bit, as
         // the manual sync does.
         ALOG(LOG_INF, "No usable saved position; keeping it pending: %s", path.c_str());

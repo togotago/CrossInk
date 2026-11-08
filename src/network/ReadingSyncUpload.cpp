@@ -22,7 +22,8 @@
 #include "activities/reader/StatsUploadPayload.h"
 #include "sync/BookSyncFile.h"
 
-bool ReadingSyncUpload::prepareProgress(const std::string& path, KOReaderProgress& progress) {
+bool ReadingSyncUpload::prepareProgress(const std::string& path, KOReaderProgress& progress,
+                                        const bool tolerateLegacy) {
   if (!FsHelpers::hasEpubExtension(path)) return false;
   // ProgressMapper requires shared ownership. Release the whole EPUB before TLS.
   std::shared_ptr<Epub> epub = makeUniqueNoThrow<Epub>(path, "/.crosspoint");
@@ -32,9 +33,20 @@ bool ReadingSyncUpload::prepareProgress(const std::string& path, KOReaderProgres
   }
   EpubReaderUtils::Progress saved;
   if (!EpubReaderUtils::loadProgress(*epub, saved) ||
-      !epub->load(false, true, Epub::XLocationLoadMode::Immediate, true) || saved.spineIndex < 0 ||
-      saved.spineIndex >= epub->getSpineItemsCount() || !saved.hasPageCount || saved.pageCount < 1 ||
-      saved.pageNumber >= saved.pageCount) {
+      !epub->load(false, true, Epub::XLocationLoadMode::Immediate, true)) {
+    LOG_DBG("ReadingSync", "Skipping book without usable saved progress: %s", path.c_str());
+    return false;
+  }
+  if (tolerateLegacy) {
+    // Same relaxation the manual Sync Book applies: an out-of-range spine index
+    // falls back to the first section, and a record without a page count is
+    // mapped from its page index alone (totalPages 1 means "spine start", which
+    // is where a position with no pagination belongs).
+    if (saved.spineIndex < 0 || saved.spineIndex >= epub->getSpineItemsCount()) saved.spineIndex = 0;
+    if (!saved.hasPageCount) saved.pageCount = 1;
+  }
+  if (!usableSavedProgress(saved.hasPageCount, saved.pageCount, saved.pageNumber, saved.spineIndex,
+                           epub->getSpineItemsCount(), tolerateLegacy)) {
     LOG_DBG("ReadingSync", "Skipping book without usable saved progress: %s", path.c_str());
     return false;
   }

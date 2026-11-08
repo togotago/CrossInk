@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "network/AutoProgressSync.h"
+#include "network/ReadingSyncUpload.h"
 
 namespace {
 using namespace AutoProgressSync;
@@ -85,4 +86,32 @@ TEST(AutoProgressSyncBoot, RequiresTheSettingCredentialsBatteryAndWork) {
 TEST(AutoProgressSyncBoot, StopsAfterTooManyConsecutiveBoots) {
   EXPECT_FALSE(shouldArmSyncBoot(true, true, 100, 1, MAX_SYNC_BOOT_ATTEMPTS));
   EXPECT_FALSE(shouldArmSyncBoot(true, true, 100, 1, MAX_SYNC_BOOT_ATTEMPTS + 1));
+}
+
+// Legacy progress records: older firmware wrote a 6/10-byte record with no page
+// count. The manual Sync Book maps it; the sleep sync must accept the same
+// record instead of keeping that book pending forever.
+TEST(ReadingSyncUploadSavedProgress, RejectsALegacyRecordUnderTheStrictRule) {
+  // No page count: pageCount stays 0, which the foreground rule rejects.
+  EXPECT_FALSE(ReadingSyncUpload::usableSavedProgress(false, 0, 3, 1, 10, /*tolerateLegacy=*/false));
+}
+
+TEST(ReadingSyncUploadSavedProgress, AcceptsALegacyRecordWithTheManualSyncRule) {
+  // The tolerant path substitutes a page count of 1 and maps from the page index.
+  EXPECT_TRUE(ReadingSyncUpload::usableSavedProgress(false, 1, 3, 1, 10, /*tolerateLegacy=*/true));
+}
+
+TEST(ReadingSyncUploadSavedProgress, ClampsAStaleSpineOnlyForTheTolerantPath) {
+  EXPECT_FALSE(ReadingSyncUpload::usableSavedProgress(true, 10, 2, 12, 10, /*tolerateLegacy=*/false));
+  EXPECT_TRUE(ReadingSyncUpload::usableSavedProgress(true, 10, 2, 0, 10, /*tolerateLegacy=*/true));
+}
+
+TEST(ReadingSyncUploadSavedProgress, StillRejectsAnImpossiblePageInBothPaths) {
+  // pageNumber >= pageCount is a stale pagination, not a legacy record.
+  EXPECT_FALSE(ReadingSyncUpload::usableSavedProgress(true, 10, 10, 1, 10, /*tolerateLegacy=*/false));
+  EXPECT_FALSE(ReadingSyncUpload::usableSavedProgress(true, 10, 10, 1, 10, /*tolerateLegacy=*/true));
+}
+
+TEST(ReadingSyncUploadSavedProgress, RejectsAnEmptySpineList) {
+  EXPECT_FALSE(ReadingSyncUpload::usableSavedProgress(true, 10, 0, 0, 0, /*tolerateLegacy=*/true));
 }
