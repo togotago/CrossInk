@@ -1,0 +1,4 @@
+add_executable(KOReaderSyncClientTest KOReaderSyncClientTest.cpp)
+target_include_directories(KOReaderSyncClientTest PRIVATE ${REPO_ROOT}/lib/KOReaderSync)
+target_link_libraries(KOReaderSyncClientTest PRIVATE crosspoint_test_common GTest::gtest_main)
+gtest_discover_tests(KOReaderSyncClientTest)

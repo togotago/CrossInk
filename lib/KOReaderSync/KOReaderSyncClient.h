@@ -196,9 +196,18 @@ class KOReaderSyncClient {
   /** Transport-layer error from the last request (for diagnostics). */
   static int lastTransportError;
 
+  // Which heap floor a request must clear. Only a new https request performs a
+  // TLS handshake; a plain http:// request (a LAN KOSync server) or any request
+  // over an already-open session allocates only socket and string buffers.
+  // Pure so the rule is unit-tested.
+  enum class HeapFloor : uint8_t { Handshake, Request };
+  static constexpr HeapFloor heapFloorFor(const bool isHttps, const bool connectionLive) {
+    return (isHttps && !connectionLive) ? HeapFloor::Handshake : HeapFloor::Request;
+  }
+
  private:
   // One PUT, over the caller's shared connection when there is one.
   static int putJsonFor(const std::string& url, const std::string& body, Connection* connection);
-  // Handshake floors for a new TLS session, smaller ones for an open session.
-  static bool heapTooLowFor(const Connection* connection);
+  // Applies heapFloorFor() to `url` and the caller's session state.
+  static bool heapTooLowFor(const std::string& url, const Connection* connection);
 };

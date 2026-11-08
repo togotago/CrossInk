@@ -43,7 +43,10 @@ inline bool setCpuFrequencyMhz(int value) {
   return true;
 }
 constexpr int INPUT = 0;
+constexpr int INPUT_PULLUP = 2;
+constexpr int INPUT_PULLDOWN = 3;
 inline void pinMode(int, int) {}
 
 constexpr int LOW = 0;
+constexpr int HIGH = 1;
 inline int digitalRead(int) { return power_test::powerPressed ? LOW : 1; }

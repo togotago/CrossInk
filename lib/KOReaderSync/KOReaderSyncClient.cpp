@@ -180,6 +180,10 @@ void applyAuthHeaders(freeink::SecureHttpClient& http) {
   http.addHeader("Authorization", std::string("Basic ") + encoded.c_str());
   applyCustomHttpHeaders(http, KOREADER_STORE.getCustomHeaders());
 }
+
+// SecureHttpClient picks the transport from the scheme, so the heap gate needs
+// the same distinction.
+bool isHttpsUrl(const std::string& url) { return url.rfind("https://", 0) == 0; }
 #endif
 
 // A request over an already-open TLS session allocates only its request and
@@ -209,6 +213,17 @@ bool insufficientHeap() {
     return true;
   }
   return false;
+}
+
+// Scheme-aware gate. A plain http:// request never performs a handshake (the
+// client picks a WiFiClient for it), so the handshake floors would only refuse
+// a request that fits comfortably; the reused-session floor already covers its
+// socket and buffer allocations.
+bool insufficientHeapFor(const std::string& url, const bool connectionLive) {
+  if (KOReaderSyncClient::heapFloorFor(isHttpsUrl(url), connectionLive) == KOReaderSyncClient::HeapFloor::Request) {
+    return insufficientHeapForReuse();
+  }
+  return insufficientHeap();
 }
 
 #ifndef SIMULATOR
@@ -322,7 +337,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::authenticate() {
 
   const std::string url = KOREADER_STORE.getBaseUrl() + "/users/auth";
   LOG_DBG("KOSync", "Authenticating: %s (heap: %u)", url.c_str(), (unsigned)ESP.getFreeHeap());
-  if (insufficientHeap()) return LOW_MEMORY;
+  if (insufficientHeapFor(url, /*connectionLive=*/false)) return LOW_MEMORY;
 
 #ifdef SIMULATOR
   HTTPClient http;
@@ -442,7 +457,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::createUser() {
 
   const std::string url = KOREADER_STORE.getBaseUrl() + "/users/create";
   LOG_DBG("KOSync", "Creating account: %s (heap: %u)", url.c_str(), (unsigned)ESP.getFreeHeap());
-  if (insufficientHeap()) return LOW_MEMORY;
+  if (insufficientHeapFor(url, /*connectionLive=*/false)) return LOW_MEMORY;
 
   JsonDocument doc;
   doc["username"] = KOREADER_STORE.getUsername();
@@ -471,9 +486,9 @@ KOReaderSyncClient::Error KOReaderSyncClient::createUser() {
   return SERVER_ERROR;
 }
 
-bool KOReaderSyncClient::heapTooLowFor(const Connection* connection) {
-  if (connection && connection->impl && connection->impl->live) return insufficientHeapForReuse();
-  return insufficientHeap();
+bool KOReaderSyncClient::heapTooLowFor(const std::string& url, const Connection* connection) {
+  const bool connectionLive = connection && connection->impl && connection->impl->live;
+  return insufficientHeapFor(url, connectionLive);
 }
 
 KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& documentHash,
@@ -488,7 +503,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
   const std::string url =
       KOREADER_STORE.getBaseUrl() + "/syncs/progress/" + documentHash + "?position_kinds=locator,percentage";
   LOG_DBG("KOSync", "Getting progress: %s (heap: %u)", url.c_str(), (unsigned)ESP.getFreeHeap());
-  if (heapTooLowFor(connection)) return LOW_MEMORY;
+  if (heapTooLowFor(url, connection)) return LOW_MEMORY;
 
 #ifdef SIMULATOR
   HTTPClient http;
@@ -688,7 +703,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::updateProgress(const KOReaderProgr
 
   const std::string url = KOREADER_STORE.getBaseUrl() + "/syncs/progress";
   LOG_DBG("KOSync", "Updating progress: %s (heap: %u)", url.c_str(), (unsigned)ESP.getFreeHeap());
-  if (heapTooLowFor(connection)) return LOW_MEMORY;
+  if (heapTooLowFor(url, connection)) return LOW_MEMORY;
 
   std::string body;
   {
@@ -721,7 +736,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::updateProgressBatch(std::vector<KO
   std::vector<KOReaderProgress>().swap(items);
   LOG_DBG("KOSync", "Batch progress: %u books, %u bytes (heap: %u)", static_cast<unsigned>(count),
           static_cast<unsigned>(body.size()), (unsigned)ESP.getFreeHeap());
-  if (heapTooLowFor(connection)) return LOW_MEMORY;
+  if (heapTooLowFor(url, connection)) return LOW_MEMORY;
   const int httpCode = putJsonFor(url, body, connection);
   LOG_DBG("KOSync", "Batch progress response: %d", httpCode);
   // Stock KOSync and older CrossPoint Sync servers: one PUT per book instead.
@@ -831,7 +846,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgressChanges(const uint32_t 
   const std::string url = KOREADER_STORE.getBaseUrl() + query;
   LOG_DBG("KOSync", "Getting changes since %lu (heap: %u)", static_cast<unsigned long>(since),
           static_cast<unsigned>(ESP.getFreeHeap()));
-  if (insufficientHeap()) return LOW_MEMORY;
+  if (insufficientHeapFor(url, /*connectionLive=*/false)) return LOW_MEMORY;
 
 #ifdef SIMULATOR
   HTTPClient http;

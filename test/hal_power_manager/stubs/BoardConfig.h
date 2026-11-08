@@ -9,6 +9,7 @@ struct Profile {
   int batteryAdc = -1;
   struct {
     int8_t power = 2;
+    bool powerActiveHigh = false;  // mirrors the real profile field
   } input;
   struct {
     int gaugeAddr = 1;
