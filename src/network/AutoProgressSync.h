@@ -47,6 +47,27 @@ inline bool budgetExhausted(const uint32_t startMs, const uint32_t nowMs, const 
   return static_cast<uint32_t>(nowMs - startMs) >= budgetMs;
 }
 
+// What the burst does with one book. The pending bit is cleared only when the
+// book's position is known to be on the server (just uploaded, or already
+// there); otherwise the change is kept for the next sleep or manual sync.
+enum class PendingAction : uint8_t {
+  UploadAndClearOnSuccess,
+  KeepPending,  // the remote is ahead, or the book could not be handled
+  ClearNow,     // the server already has exactly this position
+};
+
+inline PendingAction pendingActionFor(const Decision decision) {
+  switch (decision) {
+    case Decision::Upload:
+      return PendingAction::UploadAndClearOnSuccess;
+    case Decision::RemoteAhead:
+      return PendingAction::KeepPending;
+    case Decision::InSync:
+      return PendingAction::ClearNow;
+  }
+  return PendingAction::KeepPending;
+}
+
 enum class JoinPhase : uint8_t {
   CachedAp,  // join straight at the remembered channel and BSSID
   FullScan,  // a normal join: the AP roamed, changed channel, or was never seen

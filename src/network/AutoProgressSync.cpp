@@ -216,22 +216,23 @@ AutoProgressSync::Result runBurst() {
       }
     }
 
-    switch (AutoProgressSync::decide(local.percentage, hasRemote, remote.percentage)) {
-      case AutoProgressSync::Decision::Upload:
+    switch (
+        AutoProgressSync::pendingActionFor(AutoProgressSync::decide(local.percentage, hasRemote, remote.percentage))) {
+      case AutoProgressSync::PendingAction::UploadAndClearOnSuccess:
         batchPaths.push_back(path);
         batch.push_back(std::move(local));
         // The batch route takes at most eight positions; flush a full batch
         // instead of growing it past what one request can send.
         if (batch.size() >= KOReaderSyncClient::MAX_PROGRESS_BATCH) flush(result, batch, batchPaths, connection);
         break;
-      case AutoProgressSync::Decision::RemoteAhead:
+      case AutoProgressSync::PendingAction::KeepPending:
         // The partner device is further ahead. Never move the server backwards;
         // leave this change pending and offer the remote position on the
         // book's next open.
         if (hasRemote && !fromParked) parkRemote(remote);
         ++result.parked;
         break;
-      case AutoProgressSync::Decision::InSync:
+      case AutoProgressSync::PendingAction::ClearNow:
         SyncPending::clear(path, SyncPending::PROGRESS_BIT);
         ++result.inSync;
         break;
