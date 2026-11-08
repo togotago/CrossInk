@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIRST = hashlib.md5(b'first.epub').hexdigest()
 SECOND = hashlib.md5(b'second.EPUB').hexdigest()
 MODES = ['upload', 'batch', 'batch-unsupported', 'remote-ahead', 'server-error', 'no-network',
-         'no-network-failfast', 'parked-ahead-no-network']
+         'parked-ahead-no-network']
 
 
 def describe(requests):
@@ -109,7 +109,7 @@ def main():
                     CROSSINK_AUTOSYNC_TEST_SERVER=f'http://127.0.0.1:{server.server_port}',
                     CROSSINK_AUTOSYNC_TEST_MODE=mode,
                 )
-                if mode in ('no-network', 'no-network-failfast', 'parked-ahead-no-network'):
+                if mode in ('no-network', 'parked-ahead-no-network'):
                     # No join can succeed, so any attempt shows up as a timeout
                     # in the log and as a NoNetwork result.
                     env['CROSSPOINT_SIM_WIFI_CONNECT'] = 'fail'
@@ -171,14 +171,8 @@ def main():
                     assert b'/read/first.epub' in pending, 'pending bit lost after a 500'
                 elif mode == 'no-network':
                     # A GET is needed, the join fails, and the bit stays for the
-                    # next sleep or a manual sync.
-                    assert not requests, requests
-                    assert joined, log[-4000:]
-                    assert b'/read/first.epub' in pending, 'pending bit lost without a network'
-                    assert 'no network' in sleep_line, sleep_line
-                elif mode == 'no-network-failfast':
-                    # A refused access point ends the attempt on the driver's
-                    # answer instead of waiting out the 5 s join budget.
+                    # next sleep or a manual sync. A refused AP ends the attempt
+                    # on the driver's answer instead of waiting out the budget.
                     assert not requests, requests
                     assert 'Wi-Fi refused after' in log, log[-4000:]
                     assert 'WiFi join timed out' not in log, log[-4000:]
