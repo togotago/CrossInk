@@ -329,9 +329,9 @@ AutoProgressSync::Result runBurst() {
             continue;
           }
         }
-        const auto decision = item.needsGet ? AutoProgressSync::decide(item.local.percentage, hasRemote,
-                                                                       remote.percentage)
-                                            : AutoProgressSync::Decision::Upload;
+        const auto decision = item.needsGet
+                                  ? AutoProgressSync::decide(item.local.percentage, hasRemote, remote.percentage)
+                                  : AutoProgressSync::Decision::Upload;
         handled = true;
         if (AutoProgressSync::pendingActionFor(decision) == AutoProgressSync::PendingAction::UploadAndClearOnSuccess) {
           batchPaths.push_back(item.path);
