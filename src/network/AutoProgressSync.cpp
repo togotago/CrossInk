@@ -91,21 +91,26 @@ bool connectLastKnownNetwork(const uint32_t budgetMs) {
   const uint32_t start = millis();
 
 #ifndef SIMULATOR
-  // Remembering the channel and BSSID skips a full-channel scan (measured
-  // 798 ms -> 205 ms for association). The hint is only for this network, and
-  // a stale one costs its 2 s budget, never the whole connect.
-  uint8_t bssid[6] = {};
-  uint8_t channel = 0;
-  const bool hasCachedAp = WIFI_STORE.getLastAp(credential->ssid, bssid, channel);
-  if (AutoProgressSync::joinPhase(hasCachedAp, 0) == AutoProgressSync::JoinPhase::CachedAp) {
-    WiFi.begin(credential->ssid.c_str(), credential->password.c_str(), channel, bssid);
+  // The remembered channel is a scan-start hint, not a pinned AP: with
+  // bssid_set=0 ESP-IDF still scans, starting on (and preferring) that channel.
+  // Pinning the cached BSSID instead made this a directed auth that failed 3 of
+  // 3 times on the device and burned its full 2 s budget on every burst — one
+  // SSID commonly maps to several BSSIDs (mesh, repeaters, band steering) and
+  // an AP can also change channel. The channel hint keeps the fast join without
+  // the dead end, and the normal join below remains the fallback.
+  uint8_t cachedBssid[6] = {};
+  uint8_t cachedChannel = 0;
+  const bool hasCachedAp = WIFI_STORE.getLastAp(credential->ssid, cachedBssid, cachedChannel);
+  if (AutoProgressSync::joinPhase(hasCachedAp, 0) == AutoProgressSync::JoinPhase::CachedAp && cachedChannel > 0) {
+    WiFi.begin(credential->ssid.c_str(), credential->password.c_str(), cachedChannel, nullptr);
     while (WiFi.status() != WL_CONNECTED && millis() - start < AutoProgressSync::FAST_JOIN_BUDGET_MS) delay(50);
     if (WiFi.status() == WL_CONNECTED) {
-      ALOG(LOG_INF, "WiFi joined the cached AP in %u ms", static_cast<unsigned>(millis() - start));
+      ALOG(LOG_INF, "WiFi joined the cached channel in %u ms", static_cast<unsigned>(millis() - start));
       return true;
     }
-    ALOG(LOG_INF, "Cached AP did not answer; falling back to a normal join");
-    WiFi.disconnect(false, false, 1000);
+    ALOG(LOG_INF, "Cached channel did not answer; falling back to a normal join");
+    // No disconnect here: WiFi.begin() rewrites the whole station config, and
+    // the disconnect can burn a second the retry needs.
   }
 #endif
 

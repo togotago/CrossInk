@@ -83,7 +83,7 @@ inline PendingAction pendingActionFor(const Decision decision) {
 }
 
 enum class JoinPhase : uint8_t {
-  CachedAp,  // join straight at the remembered channel and BSSID
+  CachedAp,  // scan starting from the remembered channel (no BSSID pin)
   FullScan,  // a normal join: the AP roamed, changed channel, or was never seen
 };
 
