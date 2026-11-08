@@ -50,6 +50,8 @@ class KOReaderCredentialStore : public PersistableStore<KOReaderCredentialStore>
   std::string serverSupportUrl;  // Base URL serverSupport was learned for.
   bool sendMetadata = false;     // Send document metadata with progress sync
   KOReaderSyncBehavior syncBehavior = KOReaderSyncBehavior::SMART;
+  // Off by default: pushing the reading position at sleep is opt-in.
+  bool autoSyncProgress = false;
 
   // Private constructor for singleton
   KOReaderCredentialStore() = default;
@@ -137,6 +139,13 @@ class KOReaderCredentialStore : public PersistableStore<KOReaderCredentialStore>
   KOReaderSyncBehavior getSyncBehavior() const {
     ensureLoaded();
     return syncBehavior;
+  }
+
+  // Push each book's reading position to the server when the reader sleeps.
+  void setAutoSyncProgress(bool enabled);
+  bool getAutoSyncProgress() const {
+    ensureLoaded();
+    return autoSyncProgress;
   }
 };
 

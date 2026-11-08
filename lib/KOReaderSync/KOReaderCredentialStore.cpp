@@ -41,6 +41,7 @@ void KOReaderCredentialStore::toJson(JsonDocument& doc) const {
     doc["serverSupportUrl"] = serverSupportUrl;
   }
   doc["syncBehavior"] = static_cast<uint8_t>(syncBehavior);
+  doc["autoSyncProgress"] = autoSyncProgress;
 }
 
 bool KOReaderCredentialStore::fromJson(JsonVariantConst doc) {
@@ -120,6 +121,8 @@ bool KOReaderCredentialStore::fromJson(JsonVariantConst doc) {
     setSyncBehavior(KOReaderSyncBehavior::ASK_EVERY_TIME);
     needsResave = true;
   }
+
+  setAutoSyncProgress(doc["autoSyncProgress"] | false);
 
   if (needsResave) {
     LOG_DBG("KRS", "Resaving KOReader credentials to update format");
@@ -245,6 +248,11 @@ void KOReaderCredentialStore::setSyncBehavior(KOReaderSyncBehavior behavior) {
 void KOReaderCredentialStore::setServerType(KOReaderServerType type) {
   ensureLoaded();
   serverType = static_cast<unsigned>(type) <= 2 ? type : KOReaderServerType::KOSYNC;
+}
+
+void KOReaderCredentialStore::setAutoSyncProgress(const bool enabled) {
+  ensureLoaded();
+  autoSyncProgress = enabled;
 }
 
 bool KOReaderCredentialStore::setCustomHeader(size_t index, const std::string& name, const std::string& value) {

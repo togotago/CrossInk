@@ -38,15 +38,16 @@ enum Row : uint8_t {
   ROW_INCLUDE_STATS,
   ROW_INCLUDE_CLIPPINGS,
   ROW_SYNC_BEHAVIOR,
+  ROW_AUTO_SYNC_PROGRESS,
   ROW_DOCUMENT_MATCHING,
   ROW_SEND_METADATA,
   ROW_COUNT
 };
 constexpr StrId ROW_LABELS[ROW_COUNT] = {
-    StrId::STR_USERNAME,        StrId::STR_PASSWORD,        StrId::STR_SYNC_SERVER_URL, StrId::STR_SERVER_TYPE,
-    StrId::STR_CUSTOM_HEADER_1, StrId::STR_CUSTOM_HEADER_2, StrId::STR_SIGN_UP,         StrId::STR_AUTHENTICATE,
-    StrId::STR_READING_STATS,   StrId::STR_CLIPPINGS,       StrId::STR_SYNC_BEHAVIOR,   StrId::STR_DOCUMENT_MATCHING,
-    StrId::STR_SEND_METADATA};
+    StrId::STR_USERNAME,          StrId::STR_PASSWORD,        StrId::STR_SYNC_SERVER_URL, StrId::STR_SERVER_TYPE,
+    StrId::STR_CUSTOM_HEADER_1,   StrId::STR_CUSTOM_HEADER_2, StrId::STR_SIGN_UP,         StrId::STR_AUTHENTICATE,
+    StrId::STR_READING_STATS,     StrId::STR_CLIPPINGS,       StrId::STR_SYNC_BEHAVIOR,   StrId::STR_AUTO_SYNC_ON_SLEEP,
+    StrId::STR_DOCUMENT_MATCHING, StrId::STR_SEND_METADATA};
 constexpr StrId SERVER_TYPES[] = {StrId::STR_CROSSPOINT, StrId::STR_KOSYNC_SERVER, StrId::STR_OTHER};
 constexpr fui::ActionId ACTION_ROW = 1;
 
@@ -293,6 +294,11 @@ void KOReaderSettingsActivity::handleSelection() {
       KOREADER_STORE.saveToFile();
       requestUpdate();
       break;
+    case ROW_AUTO_SYNC_PROGRESS:
+      KOREADER_STORE.setAutoSyncProgress(!KOREADER_STORE.getAutoSyncProgress());
+      KOREADER_STORE.saveToFile();
+      requestUpdate();
+      break;
     default:
       break;
   }
@@ -366,6 +372,10 @@ void KOReaderSettingsActivity::fillRow(const uint16_t row, fui::ListItem& item) 
     case ROW_SEND_METADATA:
       item.toggle = true;
       item.toggleChecked = KOREADER_STORE.getSendMetadata();
+      break;
+    case ROW_AUTO_SYNC_PROGRESS:
+      item.toggle = true;
+      item.toggleChecked = KOREADER_STORE.getAutoSyncProgress();
       break;
     default:
       break;

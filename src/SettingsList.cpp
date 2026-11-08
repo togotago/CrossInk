@@ -386,6 +386,15 @@ const std::vector<SettingInfo>& getBaseSettingsList() {
         },
         "koSyncBehavior", StrId::STR_SYNC_SERVER));
 
+    add(SettingInfo::DynamicEnum(
+        StrId::STR_AUTO_SYNC_ON_SLEEP, {StrId::STR_OFF, StrId::STR_ON},
+        [] { return static_cast<uint8_t>(KOREADER_STORE.getAutoSyncProgress()); },
+        [](uint8_t v) {
+          KOREADER_STORE.setAutoSyncProgress(v != 0);
+          KOREADER_STORE.saveToFile();
+        },
+        "koAutoSyncProgress", StrId::STR_SYNC_SERVER));
+
     // Legacy fields stay in JSON for one-time status bar migration; the web
     // editor uses /api/status-bars instead of exposing these controls.
     add(SettingInfo::Toggle(StrId::STR_CHAPTER_PAGE_COUNT, &CrossPointSettings::statusBarChapterPageCount,
