@@ -218,14 +218,6 @@ AutoProgressSync::Result runBurst() {
     return result;
   }
 
-  std::vector<KOReaderProgress> batch;
-  std::vector<std::string> batchPaths;
-  batch.reserve(KOReaderSyncClient::MAX_PROGRESS_BATCH);
-  batchPaths.reserve(KOReaderSyncClient::MAX_PROGRESS_BATCH);
-  // One TLS session for the whole burst: the GET of each book and the PUT or
-  // batch PUT share it instead of paying a handshake per request.
-  KOReaderSyncClient::Connection connection;
-
   // The radio is joined at most once per burst, and only when a GET or PUT is
   // really needed: a book whose parked remote is already ahead is settled from
   // the SD card alone, so it must never cost a Wi-Fi join.
@@ -246,95 +238,122 @@ AutoProgressSync::Result runBurst() {
     return true;
   };
 
-  std::string path;
-  uint8_t mask = 0;
-  bool handled = false;
-  while (cursor.next(path, mask) == SyncPending::Cursor::Step::Entry) {
-    if (!(mask & SyncPending::PROGRESS_BIT) || !FsHelpers::hasEpubExtension(path)) continue;
-    if (AutoProgressSync::budgetExhausted(start, millis())) {
-      result.budgetHit = true;
-      break;
-    }
-    if (!Storage.exists(path.c_str())) {
-      // Moved or deleted outside the reader: nothing to map. Keep the bit.
-      ALOG(LOG_INF, "Pending book missing; keeping it pending: %s", path.c_str());
-      ++result.failed;
-      continue;
-    }
-
+  // Phase 1, radio off: map every pending book to its position first. Opening
+  // an EPUB needs heap that Wi-Fi and a TLS session no longer leave free
+  // (measured on an X4: 97 KB free before the join, 37 KB after), so no book is
+  // mapped once the radio is up. At most one batch per sleep; the rest wait.
+  struct Item {
+    std::string path;
     KOReaderProgress local;
-    if (!ReadingSyncUpload::prepareProgress(path, local)) {
-      // No usable saved position (unread, or failed to map): keep the bit, as
-      // the manual sync does.
-      ALOG(LOG_INF, "No usable saved position; keeping it pending: %s", path.c_str());
-      ++result.failed;
-      continue;
-    }
-
-    SyncParked::Entry parked;
-    KOReaderProgress remote;
-    bool hasRemote = false;
-    bool fromParked = false;
-    if (SyncParked::find(local.document, parked)) {
-      // The parked position is the newest this reader saw; compare it instead
-      // of a GET so it is never overwritten blindly, and without a radio.
-      remote = parked.toProgress(local.document);
-      hasRemote = true;
-      fromParked = true;
-      ALOG(LOG_INF, "Comparing with a parked remote position: %s", path.c_str());
-    } else {
+    bool needsGet = true;
+  };
+  std::vector<Item> items;
+  items.reserve(KOReaderSyncClient::MAX_PROGRESS_BATCH);
+  bool handled = false;
+  {
+    std::string path;
+    uint8_t mask = 0;
+    while (items.size() < KOReaderSyncClient::MAX_PROGRESS_BATCH &&
+           cursor.next(path, mask) == SyncPending::Cursor::Step::Entry) {
+      if (!(mask & SyncPending::PROGRESS_BIT) || !FsHelpers::hasEpubExtension(path)) continue;
       if (AutoProgressSync::budgetExhausted(start, millis())) {
         result.budgetHit = true;
         break;
       }
-      if (!ensureNetwork()) {
+      if (!Storage.exists(path.c_str())) {
+        // Moved or deleted outside the reader: nothing to map. Keep the bit.
+        ALOG(LOG_INF, "Pending book missing; keeping it pending: %s", path.c_str());
         ++result.failed;
         continue;
       }
-      const auto error = KOReaderSyncClient::getProgress(local.document, remote, &connection);
-      if (error == KOReaderSyncClient::OK) {
-        hasRemote = true;
-      } else if (error != KOReaderSyncClient::NOT_FOUND) {
-        ALOG(LOG_INF, "GET failed (%s); keeping it pending", KOReaderSyncClient::errorString(error).c_str());
+      Item item;
+      if (!ReadingSyncUpload::prepareProgress(path, item.local)) {
+        // No usable saved position (unread, or failed to map): keep the bit, as
+        // the manual sync does.
+        ALOG(LOG_INF, "No usable saved position; keeping it pending: %s", path.c_str());
         ++result.failed;
-        // A dead transport or exhausted heap fails every remaining book too.
-        if (error == KOReaderSyncClient::NETWORK_ERROR || error == KOReaderSyncClient::LOW_MEMORY) break;
         continue;
       }
-    }
-
-    const auto decision = AutoProgressSync::decide(local.percentage, hasRemote, remote.percentage);
-    handled = true;
-    switch (AutoProgressSync::pendingActionFor(decision)) {
-      case AutoProgressSync::PendingAction::UploadAndClearOnSuccess:
-        if (!ensureNetwork()) {
-          ++result.failed;
-          break;
+      SyncParked::Entry parked;
+      if (SyncParked::find(item.local.document, parked)) {
+        // The parked position is the newest this reader saw; compare it instead
+        // of a GET so it is never overwritten blindly, and without a radio.
+        ALOG(LOG_INF, "Comparing with a parked remote position: %s", path.c_str());
+        const auto decision = AutoProgressSync::decide(item.local.percentage, true, parked.percentage);
+        handled = true;
+        if (AutoProgressSync::pendingActionFor(decision) == AutoProgressSync::PendingAction::ClearNow) {
+          if (decision == AutoProgressSync::Decision::RemoteAhead) {
+            ++result.parked;
+          } else {
+            ++result.inSync;
+          }
+          SyncPending::clear(path, SyncPending::PROGRESS_BIT);
+          continue;
         }
-        batchPaths.push_back(path);
-        batch.push_back(std::move(local));
-        // The batch route takes at most eight positions; flush a full batch
-        // instead of growing it past what one request can send.
-        if (batch.size() >= KOReaderSyncClient::MAX_PROGRESS_BATCH) flush(result, batch, batchPaths, connection);
-        break;
-      case AutoProgressSync::PendingAction::ClearNow:
+        item.needsGet = false;
+      }
+      item.path = path;
+      items.push_back(std::move(item));
+    }
+  }
+  cursor.end();
+  AutoProgressSync::noteHeap("mapped");
+
+  // Phase 2, radio on only if a book needs a GET or a PUT. One TLS session for
+  // the whole burst: each GET and the PUT or batch PUT share it.
+  if (!items.empty()) {
+    KOReaderSyncClient::Connection connection;
+    std::vector<KOReaderProgress> batch;
+    std::vector<std::string> batchPaths;
+    batch.reserve(items.size());
+    batchPaths.reserve(items.size());
+    if (!ensureNetwork()) {
+      result.failed += static_cast<uint8_t>(items.size());
+    } else {
+      for (size_t i = 0; i < items.size(); ++i) {
+        Item& item = items[i];
+        KOReaderProgress remote;
+        bool hasRemote = false;
+        if (item.needsGet) {
+          const auto error = KOReaderSyncClient::getProgress(item.local.document, remote, &connection);
+          if (error == KOReaderSyncClient::OK) {
+            hasRemote = true;
+          } else if (error != KOReaderSyncClient::NOT_FOUND) {
+            ALOG(LOG_INF, "GET failed (%s); keeping it pending", KOReaderSyncClient::errorString(error).c_str());
+            // A dead transport or exhausted heap fails every remaining book too.
+            if (error == KOReaderSyncClient::NETWORK_ERROR || error == KOReaderSyncClient::LOW_MEMORY) {
+              result.failed += static_cast<uint8_t>(items.size() - i);
+              break;
+            }
+            ++result.failed;
+            continue;
+          }
+        }
+        const auto decision = item.needsGet ? AutoProgressSync::decide(item.local.percentage, hasRemote,
+                                                                       remote.percentage)
+                                            : AutoProgressSync::Decision::Upload;
+        handled = true;
+        if (AutoProgressSync::pendingActionFor(decision) == AutoProgressSync::PendingAction::UploadAndClearOnSuccess) {
+          batchPaths.push_back(item.path);
+          batch.push_back(std::move(item.local));
+          continue;
+        }
         if (decision == AutoProgressSync::Decision::RemoteAhead) {
           // The partner device is further ahead. Never move the server
           // backwards; offer the remote position on the book's next open and
           // drop the pending bit, because this change can never be uploaded
           // under the Smart rule. The next progress save re-marks the book.
-          if (hasRemote && !fromParked) parkRemote(remote);
+          if (hasRemote) parkRemote(remote);
           ++result.parked;
         } else {
           ++result.inSync;
         }
-        SyncPending::clear(path, SyncPending::PROGRESS_BIT);
-        break;
+        SyncPending::clear(item.path, SyncPending::PROGRESS_BIT);
+      }
+      AutoProgressSync::noteHeap("pre-put");
+      flush(result, batch, batchPaths, connection);
     }
   }
-  cursor.end();
-
-  flush(result, batch, batchPaths, connection);
   if (network == Network::Up) wifiOff();
   // Books settled from the SD card run no request, but the burst did run.
   if (result.status == AutoProgressSync::Result::Status::Skipped && handled) {

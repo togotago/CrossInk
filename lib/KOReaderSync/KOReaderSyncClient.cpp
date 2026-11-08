@@ -52,9 +52,14 @@ int KOReaderSyncClient::lastTransportError = 0;
 struct KOReaderSyncClient::Connection::Impl {
   Impl() { http.setInsecure(); }
   freeink::SecureHttpClient http;
+  // True once a request over this client got an HTTP answer: the TLS session
+  // is up, so the next request needs no handshake buffers.
+  bool live = false;
 };
 #else
-struct KOReaderSyncClient::Connection::Impl {};
+struct KOReaderSyncClient::Connection::Impl {
+  bool live = false;
+};
 #endif
 
 KOReaderSyncClient::Connection::Connection() : impl(new (std::nothrow) Impl()) {}
@@ -176,6 +181,23 @@ void applyAuthHeaders(freeink::SecureHttpClient& http) {
   applyCustomHttpHeaders(http, KOREADER_STORE.getCustomHeaders());
 }
 #endif
+
+// A request over an already-open TLS session allocates only its request and
+// response buffers, never the handshake's. Gating it like a new handshake made
+// the PUT after a GET fail on the sleep path (37 KB free with Wi-Fi up).
+constexpr uint32_t MIN_FREE_HEAP_FOR_REUSED_TLS = 12000;
+constexpr uint32_t MIN_MAX_ALLOC_HEAP_FOR_REUSED_TLS = 8000;
+
+bool insufficientHeapForReuse() {
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t maxAllocHeap = ESP.getMaxAllocHeap();
+  if (freeHeap < MIN_FREE_HEAP_FOR_REUSED_TLS || maxAllocHeap < MIN_MAX_ALLOC_HEAP_FOR_REUSED_TLS) {
+    LOG_ERR("KOSync", "Insufficient heap for a reused TLS request: %u bytes free, %u max alloc", freeHeap,
+            maxAllocHeap);
+    return true;
+  }
+  return false;
+}
 
 // True when free heap is too low to risk a TLS handshake.
 bool insufficientHeap() {
@@ -449,6 +471,11 @@ KOReaderSyncClient::Error KOReaderSyncClient::createUser() {
   return SERVER_ERROR;
 }
 
+bool KOReaderSyncClient::heapTooLowFor(const Connection* connection) {
+  if (connection && connection->impl && connection->impl->live) return insufficientHeapForReuse();
+  return insufficientHeap();
+}
+
 KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& documentHash,
                                                           KOReaderProgress& outProgress, Connection* connection) {
   lastHttpCode = 0;
@@ -461,7 +488,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
   const std::string url =
       KOREADER_STORE.getBaseUrl() + "/syncs/progress/" + documentHash + "?position_kinds=locator,percentage";
   LOG_DBG("KOSync", "Getting progress: %s (heap: %u)", url.c_str(), (unsigned)ESP.getFreeHeap());
-  if (insufficientHeap()) return LOW_MEMORY;
+  if (heapTooLowFor(connection)) return LOW_MEMORY;
 
 #ifdef SIMULATOR
   HTTPClient http;
@@ -528,7 +555,9 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
   // A shared connection keeps the TLS session open for the caller's next
   // request; without one this call owns its connection, as before.
   if (connection && connection->impl) {
-    return getProgressOver(connection->impl->http, url, documentHash, outProgress, true);
+    const Error result = getProgressOver(connection->impl->http, url, documentHash, outProgress, true);
+    connection->impl->live = result != NETWORK_ERROR;
+    return result;
   }
   freeink::SecureHttpClient http;
   http.setInsecure();
@@ -629,6 +658,7 @@ int KOReaderSyncClient::putJsonFor(const std::string& url, const std::string& bo
 #else
   if (!connection || !connection->impl) return putJson(url, body);
   const int httpCode = putJsonOver(connection->impl->http, url, body, true);
+  connection->impl->live = httpCode > 0;
   lastHttpCode = httpCode;
   lastTransportError = (httpCode < 0) ? httpCode : 0;
   return httpCode;
@@ -658,7 +688,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::updateProgress(const KOReaderProgr
 
   const std::string url = KOREADER_STORE.getBaseUrl() + "/syncs/progress";
   LOG_DBG("KOSync", "Updating progress: %s (heap: %u)", url.c_str(), (unsigned)ESP.getFreeHeap());
-  if (insufficientHeap()) return LOW_MEMORY;
+  if (heapTooLowFor(connection)) return LOW_MEMORY;
 
   std::string body;
   {
@@ -691,7 +721,7 @@ KOReaderSyncClient::Error KOReaderSyncClient::updateProgressBatch(std::vector<KO
   std::vector<KOReaderProgress>().swap(items);
   LOG_DBG("KOSync", "Batch progress: %u books, %u bytes (heap: %u)", static_cast<unsigned>(count),
           static_cast<unsigned>(body.size()), (unsigned)ESP.getFreeHeap());
-  if (insufficientHeap()) return LOW_MEMORY;
+  if (heapTooLowFor(connection)) return LOW_MEMORY;
   const int httpCode = putJsonFor(url, body, connection);
   LOG_DBG("KOSync", "Batch progress response: %d", httpCode);
   // Stock KOSync and older CrossPoint Sync servers: one PUT per book instead.

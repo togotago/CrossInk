@@ -199,4 +199,6 @@ class KOReaderSyncClient {
  private:
   // One PUT, over the caller's shared connection when there is one.
   static int putJsonFor(const std::string& url, const std::string& body, Connection* connection);
+  // Handshake floors for a new TLS session, smaller ones for an open session.
+  static bool heapTooLowFor(const Connection* connection);
 };
