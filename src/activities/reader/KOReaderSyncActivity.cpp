@@ -292,6 +292,8 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
 
   WiFi.setSleep(false);
   LOG_DBG("KOSync", "WiFi sleep disabled for sync");
+  // One TLS session for the GET and the PUT of this sync.
+  syncConnection = makeUniqueNoThrow<KOReaderSyncClient::Connection>();
 
   sdFontSystem.releaseForNetwork(renderer);
 
@@ -437,6 +439,7 @@ void KOReaderSyncActivity::performSync() {
   }
   if (requestUpdateAndWait() != RequestUpdateResult::Rendered) {
     LOG_ERR("KOSync", "Fetch progress screen could not be rendered synchronously; aborting sync");
+    endSyncConnection();
     if (!folderSync) wifiOff();
     {
       RenderLock lock(*this);
@@ -456,7 +459,7 @@ void KOReaderSyncActivity::performSync() {
     remoteProgress = std::move(*injectedRemote);
     injectedRemote.reset();
   } else {
-    result = KOReaderSyncClient::getProgress(documentHash, remoteProgress);
+    result = KOReaderSyncClient::getProgress(documentHash, remoteProgress, syncConnection.get());
   }
   LOG_DBG("KOSync", "Remote (%s): result=%d http=%d doc=%s remote=%.6f xpath=%s", matchMethodName(primaryMatchMethod),
           result, KOReaderSyncClient::lastHttpCode, documentHash.c_str(), remoteProgress.percentage,
@@ -569,6 +572,7 @@ void KOReaderSyncActivity::performUpload() {
   }
   if (requestUpdateAndWait() != RequestUpdateResult::Rendered) {
     LOG_ERR("KOSync", "Upload progress screen could not be rendered synchronously; aborting upload");
+    endSyncConnection();
     if (!folderSync) wifiOff();
     {
       RenderLock lock(*this);
@@ -632,7 +636,7 @@ void KOReaderSyncActivity::performUpload() {
   // (consistent with the release-before-sync pattern in performSync); nothing below needs it.
   epub.reset();
 
-  const auto result = KOReaderSyncClient::updateProgress(progress);
+  const auto result = KOReaderSyncClient::updateProgress(progress, syncConnection.get());
 
   if (result == KOReaderSyncClient::OK) {
     progressSucceeded = true;
@@ -640,6 +644,7 @@ void KOReaderSyncActivity::performUpload() {
   }
 
   // Drop the radio while user reads the result; full teardown happens at silent reboot.
+  endSyncConnection();
   if (!folderSync) wifiOff();
 
   if (result != KOReaderSyncClient::OK) {
@@ -740,6 +745,7 @@ bool KOReaderSyncActivity::uploadExtras() {
     return false;
   }
   if (!StatsUploadClient::failed(globalStatsResult) && extrasResult.success()) return true;
+  endSyncConnection();
   if (!folderSync) wifiOff();
   {
     RenderLock lock(*this);
@@ -882,6 +888,7 @@ void KOReaderSyncActivity::onExit() {
   Activity::onExit();
 
   if (wifiActivated && !folderSync) {
+    endSyncConnection();
     wifiOff();
     if (APP_STATE.pendingOverlayResume.returnsToBookList()) {
       silentRestart();

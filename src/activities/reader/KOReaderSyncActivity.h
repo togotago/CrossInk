@@ -152,6 +152,10 @@ class KOReaderSyncActivity final : public Activity {
   // WiFi.getMode() because performUpload() calls esp_wifi_stop() on the way out,
   // which makes WiFi.getMode() return WIFI_MODE_NULL.
   bool wifiActivated = false;
+  // One TLS session for this sync's GET and PUT, so the second request does not
+  // pay a second handshake. Reset before the radio is switched off.
+  std::unique_ptr<KOReaderSyncClient::Connection> syncConnection;
+  void endSyncConnection() { syncConnection.reset(); }
   bool lockInitialConfirmRelease = false;
   bool touchOverrideActive = false;
 
