@@ -14,6 +14,7 @@
 
 #include "ClippingStore.h"
 #include "CrossPointSettings.h"
+#include "AutoProgressSyncSmokeTest.h"
 #include "activities/reader/BookReadingStats.h"
 #include "activities/reader/EpubReaderUtils.h"
 #include "activities/reader/GlobalReadingStats.h"
@@ -162,6 +163,9 @@ bool prepareReadingUploadSmokeTest() {
     require(EpubReaderUtils::saveProgress(epub, 0, 2, 10), "restore local fixture");
   }
   require(!ReadingSyncUpload::prepareProgress("/read/unread.epub", progress), "unread book skipped");
+  // Sleep-time push, driven through its library entry point (the simulator has
+  // no deep sleep); runs only when its own harness variables are set.
+  verifyAutoProgressSyncContract();
   if (std::getenv("CROSSINK_READING_TEST_MISSING_CACHE")) {
     Epub epub("/read/first.epub", "/.crosspoint");
     require(Storage.remove((epub.getCachePath() + "/book.bin").c_str()), "remove cached metadata");
