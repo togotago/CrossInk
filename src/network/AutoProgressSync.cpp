@@ -241,6 +241,7 @@ AutoProgressSync::Result runBurst() {
       return false;
     }
     if (trustedtime::trustedNow() == 0) trustedtime::syncNow(NTP_BUDGET_MS);
+    AutoProgressSync::noteHeap("wifi-up");
     network = Network::Up;
     return true;
   };
@@ -344,10 +345,15 @@ AutoProgressSync::Result runBurst() {
 
 }  // namespace
 
+void AutoProgressSync::noteHeap(const char* stage) {
+  traceAppend("%s heap=%u/%u", stage, static_cast<unsigned>(ESP.getFreeHeap()),
+              static_cast<unsigned>(ESP.getMaxAllocHeap()));
+}
+
 AutoProgressSync::Result AutoProgressSync::pushPending(const uint8_t batteryPercent) {
   Result result;
   if (!KOREADER_STORE.getAutoSyncProgress()) return result;
-  traceLen = 0;
+  noteHeap("start");
   traceAppend("battery=%u%%", static_cast<unsigned>(batteryPercent));
   if (!KOREADER_STORE.hasCredentials()) {
     ALOG(LOG_DBG, "No sync credentials; skipping");

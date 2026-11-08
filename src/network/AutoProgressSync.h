@@ -93,6 +93,9 @@ struct Result {
   bool budgetHit = false;
 };
 
+// Adds free heap and the largest free block to the SD trace of the next burst.
+void noteHeap(const char* stage);
+
 // batteryPercent is the same reading the plugin sleep hook uses (main.cpp).
 // Leaves Wi-Fi off.
 Result pushPending(uint8_t batteryPercent);

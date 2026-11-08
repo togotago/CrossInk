@@ -1185,6 +1185,15 @@ void enterDeepSleep(bool fromTimeout) {
   // once, and a change skipped here would only wait for the next sleep. Bounded
   // and best-effort: a book that fails keeps its pending bit for the next sleep
   // or a manual sync.
+  if (KOREADER_STORE.getAutoSyncProgress()) {
+    // Same release every network screen does before it brings up Wi-Fi and
+    // TLS: a reader SD font keeps glyph, kerning and advance tables resident,
+    // and with it Wi-Fi plus wolfSSL do not fit (measured: GET failed with
+    // LOW_MEMORY at 75 KB free / 29 KB max block). Deep sleep follows, and the
+    // next boot loads the font again, so nothing needs restoring.
+    AutoProgressSync::noteHeap("pre-release");
+    sdFontSystem.releaseForNetwork(renderer);
+  }
   AutoProgressSync::pushPending(static_cast<uint8_t>(powerManager.getBatteryPercentage()));
 
   // All sleep-time file writes are complete. Stop SDMMC before the power path
